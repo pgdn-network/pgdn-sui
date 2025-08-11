@@ -16,6 +16,7 @@ from datetime import datetime
 from .models import SuiDataResult
 from .protobuf_manager import SuiProtobufManager
 from .utils import get_primary_port, calculate_gini_coefficient
+from .response_format import standard_response, format_json
 from .extractors import (
     RpcExtractor, 
     GrpcExtractor, 
@@ -467,10 +468,18 @@ class SuiDataExtractor:
             result.min_response_time = min(response_times)
 
     def export_data(self, results: List[SuiDataResult], pretty: bool = False) -> str:
-        """Export Sui data as flat JSON"""
-        if pretty:
-            return json.dumps([asdict(result) for result in results], indent=2, default=str)
-        return json.dumps([asdict(result) for result in results], separators=(',', ':'), default=str)
+        """Export Sui data using standard response format"""
+        data = [asdict(result) for result in results]
+        
+        response = standard_response(
+            data=data,
+            operation="data_extraction", 
+            data_type="sui_data",
+            stage="extract",
+            total_nodes=len(results)
+        )
+        
+        return format_json(response, pretty)
 
 
 # CLI Interface - maintaining the same entry point as original
