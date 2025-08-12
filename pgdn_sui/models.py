@@ -84,8 +84,9 @@ class SuiDataResult:
     # Service availability intelligence
     rpc_exposed: bool = False
     rpc_authenticated: bool = False
-    rpc_status: Optional[str] = None  # "reachable", "unreachable" (extend.md requirement)
+    rpc_status: Optional[str] = None  # "reachable", "unreachable", "rate_limited" (extend.md requirement)
     rpc_methods_available: List[str] = None
+    rpc_rate_limit_events: int = 0  # Rule C: Count of rate limit events in this run
     websocket_available: bool = False
     graphql_available: bool = False
     grpc_available: bool = False

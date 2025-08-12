@@ -77,9 +77,9 @@ class MetricsExtractor:
                 if response.status_code == 200:
                     metrics_text = response.text
                     
-                    # Check if we received valid metrics
-                    if self._is_valid_metrics_response(metrics_text):
-                        result.metrics_exposed = True
+                    # Rule A: Check if we received valid metrics with non-empty body (>0B)
+                    if len(metrics_text) > 0 and self._is_valid_metrics_response(metrics_text):
+                        result.metrics_exposed = True  # Rule A: HTTP 200 with non-empty body
                         result.service_response_times[f"metrics_dual_{port_info['port']}"] = response_time
                         
                         self.logger.info(f"Dual port metrics extracted from {port_info['url']} ({len(metrics_text)} bytes)")
@@ -107,15 +107,22 @@ class MetricsExtractor:
                         
                         return True
                     else:
-                        self.logger.debug(f"Invalid metrics response from {port_info['url']}")
+                        # Rule A: HTTP 200 but empty body or invalid → metrics_exposed stays false
+                        self.logger.debug(f"Invalid or empty metrics response from {port_info['url']} (body length: {len(metrics_text)})")
                         
                 elif response.status_code in [401, 403]:
-                    # Gated metrics - already tracked in metrics_surface above
+                    # Rule A: Gated metrics (401/403 with empty body) → metrics_exposed=false
                     result.metrics_snapshot[f"port_{port_info['port']}_gated"] = True
                     self.logger.info(f"Metrics gated on port {port_info['port']} (HTTP {response.status_code})")
                     
+                elif response.status_code == 429:
+                    # Rule A: Rate limited (429) → metrics_exposed=false
+                    result.metrics_surface[str(port_info["port"])] = {"http_status": "429"}
+                    result.metrics_snapshot[f"port_{port_info['port']}_rate_limited"] = True
+                    self.logger.info(f"Metrics rate limited on port {port_info['port']} (HTTP 429)")
+                    
                 elif response.status_code == 404:
-                    # Closed metrics - already tracked in metrics_surface above  
+                    # Rule A: Closed metrics (404) → metrics_exposed=false
                     result.metrics_snapshot[f"port_{port_info['port']}_closed"] = True
                     self.logger.debug(f"Metrics endpoint not found on port {port_info['port']} (HTTP 404)")
                     
@@ -139,13 +146,10 @@ class MetricsExtractor:
                 result.metrics_surface[str(port_info["port"])] = {"http_status": "closed"}
                 self.logger.debug(f"Metrics extraction error on port {port_info['port']}: {e}")
         
-        # No successful metrics extraction from any port
-        # Set metrics_exposed=true only if we got at least one 200 response with non-empty body
-        any_200_with_body = any(
-            result.metrics_surface.get(str(port_info["port"]), {}).get("http_status") == "200"
-            for port_info in metrics_ports
-        )
-        result.metrics_exposed = any_200_with_body
+        # Rule A: Set metrics_exposed=true ONLY if at least one metrics attempt returned HTTP 200 with NON-EMPTY body (>0B)
+        # If every attempt is timeout/connection error/404/closed → metrics_exposed=false
+        # If any attempt is 401/403/429 with empty body → metrics_exposed=false (they're gated)
+        result.metrics_exposed = False  # Default to false, only set true if we have valid metrics
         
         return False
     
@@ -203,7 +207,7 @@ class MetricsExtractor:
                 # First, check if we received an HTML error page instead of metrics
                 if metrics_text.startswith('<!DOCTYPE html') or metrics_text.startswith('<html'):
                     self.logger.warning(f"TDD metrics endpoint {primary_endpoint} returned HTML error page instead of metrics")
-                    result.metrics_exposed = True  # Endpoint exists but returns wrong content
+                    # Rule A: HTTP 200 but HTML error page → metrics_exposed stays false (invalid content)
                     result.metrics_snapshot["tdd_metrics_html_error"] = True
                     
                     # Extract uptime with priority-based approach for HTML error
@@ -217,7 +221,7 @@ class MetricsExtractor:
                 # Check if response is empty or too small to be valid metrics
                 if not metrics_text or len(metrics_text.strip()) < 10:
                     self.logger.warning(f"TDD metrics endpoint {primary_endpoint} returned empty or minimal response ({len(metrics_text)} bytes)")
-                    result.metrics_exposed = True  # Endpoint exists but empty
+                    # Rule A: HTTP 200 but empty/minimal body → metrics_exposed stays false (no valid content)
                     result.metrics_snapshot["tdd_metrics_empty"] = True
                     
                     # Extract uptime with priority-based approach for empty response
@@ -242,7 +246,7 @@ class MetricsExtractor:
                 ])
                 
                 if has_target_metrics or has_prometheus_indicators:
-                    result.metrics_exposed = True
+                    result.metrics_exposed = True  # Rule A: HTTP 200 with valid metrics content
                     result.service_response_times[f"metrics_tdd_{primary_endpoint}"] = response_time
                     
                     self.logger.info(f"TDD metrics extracted from {primary_endpoint} ({len(metrics_text)} bytes)")
@@ -285,11 +289,11 @@ class MetricsExtractor:
                 result.uptime_evidence = evidence[:128]
                 
                 if response.status_code in [401, 403]:
-                    result.metrics_exposed = False
+                    # Rule A: Gated metrics (401/403) → metrics_exposed=false
                     result.metrics_snapshot["tdd_metrics_gated"] = True
                     self.logger.info(f"TDD metrics gated (HTTP {response.status_code}) - validator likely secured")
                 elif response.status_code == 404:
-                    result.metrics_exposed = True  # exposed=1 but closed
+                    # Rule A: Closed metrics (404) → metrics_exposed=false
                     result.metrics_snapshot["tdd_metrics_closed"] = True
                     self.logger.info(f"TDD metrics endpoint not found (HTTP 404) - validator present but closed")
                 else:
@@ -298,8 +302,7 @@ class MetricsExtractor:
                 return False
                 
         except requests.exceptions.Timeout:
-            # Timeout - treat as closed per prompt.md  
-            result.metrics_exposed = True  # exposed=1 but closed
+            # Rule A: Timeout → metrics_exposed=false (closed)
             result.metrics_snapshot["tdd_metrics_timeout"] = True
             
             # Handle uptime classification for timeout
@@ -311,8 +314,7 @@ class MetricsExtractor:
             
         except requests.exceptions.ConnectionError as e:
             if "Connection refused" in str(e):
-                # Connection refused - treat as closed per prompt.md
-                result.metrics_exposed = True  # exposed=1 but closed  
+                # Rule A: Connection refused → metrics_exposed=false (closed)
                 result.metrics_snapshot["tdd_metrics_connection_refused"] = True
                 
                 # Handle uptime classification for connection refused
@@ -344,7 +346,7 @@ class MetricsExtractor:
                         ])
                         
                         if has_target_metrics or has_prometheus_indicators:
-                            result.metrics_exposed = True
+                            result.metrics_exposed = True  # Rule A: Retry successful with valid content
                             
                             # Extract uptime with priority-based approach
                             uptime_value, evidence = await self._extract_uptime_with_priority(result, metrics_text, response.status_code)
@@ -742,24 +744,18 @@ class MetricsExtractor:
         await self._calculate_checkpoint_lag(result)
 
     def _detect_narwhal_metrics(self, metrics_text: str) -> bool:
-        """Detect presence of Narwhal/consensus metrics for capability classification"""
-        narwhal_patterns = [
-            r'narwhal_\w+',
-            r'consensus_\w+',
-            r'consensus_round\s+\d+',
-            r'narwhal_primary_network_peers\s+\d+',
-            r'narwhal_certificate_created_total\s+\d+',
-            r'consensus_commit_latency_seconds\s+[0-9.]+',
-            r'consensus_proposals_in_queue\s+\d+',
-        ]
+        """
+        Rule D: Detect presence of Narwhal/consensus metrics for capability classification
+        has_narwhal_metrics := true if any metrics body (200) contains lines starting with "narwhal_" OR "consensus_"
+        """
+        lines = metrics_text.split('\n')
         
-        narwhal_indicators = 0
-        for pattern in narwhal_patterns:
-            matches = re.findall(pattern, metrics_text, re.IGNORECASE)
-            narwhal_indicators += len(matches)
+        for line in lines:
+            line = line.strip()
+            if line.startswith('narwhal_') or line.startswith('consensus_'):
+                return True
         
-        # If we find 2 or more narwhal/consensus indicators, consider it present
-        return narwhal_indicators >= 2
+        return False
 
     async def _detect_validator_evidence_from_metrics(self, result: SuiDataResult, metrics_text: str) -> Dict:
         """Detect evidence that this node is a validator from metrics"""

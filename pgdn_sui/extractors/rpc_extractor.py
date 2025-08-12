@@ -6,6 +6,7 @@ Handles JSON-RPC extraction from Sui nodes
 
 import json
 import time
+import random
 import logging
 import requests
 from typing import List, Dict, Any, Optional
@@ -45,6 +46,8 @@ class RpcExtractor:
         self.timeout = timeout
         self.config = config or {}
         self.logger = logger
+        self.backoff_delay = 0.25  # Rule C: Base 250ms backoff
+        self.max_backoff_delay = 2.0  # Rule C: Cap at 2s
     
     def _build_rpc_permutations(self, ip: str) -> List[str]:
         """Build RPC endpoint permutations exactly as specified in user requirements"""
@@ -66,6 +69,45 @@ class RpcExtractor:
                 endpoints.append(endpoint)
         
         return endpoints
+    
+    def _detect_rate_limit(self, response, response_data: dict = None) -> bool:
+        """
+        Rule C: Detect rate limiting via HTTP 429 OR JSON body containing rate limit patterns
+        """
+        # Check HTTP 429 status code
+        if hasattr(response, 'status_code') and response.status_code == 429:
+            return True
+        
+        # Check JSON body for rate limit patterns
+        if response_data and isinstance(response_data, dict):
+            # Check for specific rate limit error message patterns
+            error_msg = response_data.get("error_msg", "")
+            if "Your request is too frequent" in error_msg:
+                return True
+            
+            # Check error object for rate limit indicators
+            if "error" in response_data:
+                error_obj = response_data["error"]
+                if isinstance(error_obj, dict):
+                    error_message = error_obj.get("message", "")
+                    if "too frequent" in error_message.lower() or "rate limit" in error_message.lower():
+                        return True
+        
+        return False
+    
+    def _apply_exponential_backoff(self) -> None:
+        """
+        Rule C: Apply exponential backoff with jitter (base 250ms, cap 2s)
+        """
+        # Add jitter (±25% random variation)
+        jitter = random.uniform(0.75, 1.25)
+        actual_delay = min(self.backoff_delay * jitter, self.max_backoff_delay)
+        
+        self.logger.info(f"Rate limit detected, applying backoff: {actual_delay:.3f}s")
+        time.sleep(actual_delay)
+        
+        # Double the backoff for next time (exponential)
+        self.backoff_delay = min(self.backoff_delay * 2, self.max_backoff_delay)
         
     async def extract_rpc_intelligence_async(self, result: SuiDataResult, ip: str, ports: List[int]) -> bool:
         """Extract comprehensive intelligence via JSON-RPC with enhanced debugging and extend.md permutations"""
@@ -94,7 +136,14 @@ class RpcExtractor:
                 
                 self.logger.info(f"RPC {endpoint} responded with status {test_response.status_code} in {response_time:.3f}s")
                 
-                if test_response.status_code in [401, 403]:
+                # Rule C: Check for HTTP 429 rate limiting first
+                if test_response.status_code == 429:
+                    result.rpc_rate_limit_events += 1
+                    result.rpc_status = "rate_limited"
+                    self.logger.warning(f"Rate limit detected (HTTP 429) on RPC endpoint {endpoint}")
+                    self._apply_exponential_backoff()
+                    continue
+                elif test_response.status_code in [401, 403]:
                     result.rpc_authenticated = True
                     self.logger.info(f"SECURED: RPC endpoint {endpoint} requires authentication")
                     continue
@@ -106,6 +155,15 @@ class RpcExtractor:
                     try:
                         response_data = test_response.json()
                         self.logger.info(f"RPC response: {str(response_data)[:200]}...")
+                        
+                        # Rule C: Check for rate limiting
+                        if self._detect_rate_limit(test_response, response_data):
+                            result.rpc_rate_limit_events += 1
+                            result.rpc_status = "rate_limited"
+                            self.logger.warning(f"Rate limit detected on RPC endpoint {endpoint}")
+                            # Apply backoff for remaining requests in this run
+                            self._apply_exponential_backoff()
+                            continue  # Try next endpoint
                         
                         if "result" in response_data and response_data["result"]:
                             self.logger.info(f"SUCCESS: RPC endpoint {endpoint} returned valid data: {response_data['result']}")
@@ -228,8 +286,26 @@ class RpcExtractor:
                     "id": hash(method) % 1000
                 }, timeout=self.timeout, verify=False)
                 
+                # Rule C: Check for rate limiting
+                if response.status_code == 429:
+                    result.rpc_rate_limit_events += 1
+                    if result.rpc_status != "rate_limited":
+                        result.rpc_status = "rate_limited"
+                    self.logger.warning(f"Rate limit hit on method {method}, applying backoff")
+                    self._apply_exponential_backoff()
+                    continue  # Skip this method but continue with others
+                
                 if response.status_code == 200:
                     data = response.json()
+                    
+                    # Rule C: Check JSON body for rate limit patterns
+                    if self._detect_rate_limit(response, data):
+                        result.rpc_rate_limit_events += 1
+                        if result.rpc_status != "rate_limited":
+                            result.rpc_status = "rate_limited"
+                        self.logger.warning(f"Rate limit detected in JSON response for method {method}")
+                        self._apply_exponential_backoff()
+                        continue  # Skip this method but continue with others
                     
                     if "result" in data and data["result"] is not None:
                         await self._process_rpc_method_result(result, method, data["result"])
