@@ -5,7 +5,7 @@ with open("README.md", "r", encoding="utf-8") as fh:
 
 setup(
     name="pgdn-sui",
-    version="2.6.2",
+    version="2.9.0",
     description="Fast, step-based blockchain validator scanner for Sui network",
     long_description=long_description,
     long_description_content_type="text/markdown",

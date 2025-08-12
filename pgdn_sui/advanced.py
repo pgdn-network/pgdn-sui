@@ -16,6 +16,8 @@ from datetime import datetime
 from .models import SuiDataResult
 from .protobuf_manager import SuiProtobufManager
 from .utils import get_primary_port, calculate_gini_coefficient
+from .response_format import standard_response, format_json
+from .throughput_calculator import ThroughputCalculator
 from .extractors import (
     RpcExtractor, 
     GrpcExtractor, 
@@ -47,16 +49,7 @@ class SuiDataExtractor:
     Enhanced Sui node interrogator with native protocol support
     """
     
-    # Enhanced Sui port intelligence
-    SUI_PORT_INTEL = {
-        9000: {"name": "JSON-RPC", "expected_for": ["public_rpc", "hybrid", "validator"], "critical": True},
-        9100: {"name": "Prometheus", "expected_for": ["validator", "hybrid"], "critical": False}, 
-        8080: {"name": "gRPC", "expected_for": ["validator", "hybrid"], "critical": True},
-        50051: {"name": "Consensus-gRPC", "expected_for": ["validator", "hybrid"], "critical": True},
-        9184: {"name": "WebSocket", "expected_for": ["public_rpc", "hybrid"], "critical": False},
-        3030: {"name": "GraphQL", "expected_for": ["public_rpc", "hybrid"], "critical": False},
-        8084: {"name": "Indexer", "expected_for": ["indexer", "hybrid"], "critical": False},
-    }
+    # Port intelligence removed - now using capability-first probing approach
     
     def __init__(self, config: Dict = None):
         self.config = config or {}
@@ -70,13 +63,15 @@ class SuiDataExtractor:
             self.config.get('sui_repo_path')
         )
         
-        # Setup protobufs for gRPC
-        if GRPC_AVAILABLE:
+        # Setup protobufs for gRPC (can be disabled via config)
+        if GRPC_AVAILABLE and not self.config.get('disable_grpc', False):
             self.grpc_ready = self.protobuf_manager.setup_protobufs()
             self.sui_grpc_stubs = self.protobuf_manager.get_sui_grpc_stubs()
         else:
             self.grpc_ready = False
             self.sui_grpc_stubs = None
+            if self.config.get('disable_grpc', False):
+                self.logger.debug("gRPC functionality disabled via configuration")
         
         # Initialize Sui SDK if available
         self.sui_client = None
@@ -94,6 +89,12 @@ class SuiDataExtractor:
         self.graphql_extractor = GraphqlExtractor(self.timeout, self.config)
         self.websocket_extractor = WebsocketExtractor(self.timeout, self.config)
         self.sui_client_extractor = SuiClientExtractor(self.timeout, self.config, self.sui_client)
+        
+        # Initialize throughput calculator
+        self.throughput_calculator = ThroughputCalculator(
+            state_file_path=self.config.get('throughput_state_file'),
+            ttl_hours=self.config.get('throughput_ttl_hours', 24)
+        )
 
     @classmethod
     def from_discovery_json(cls, json_file_path: str, config: Dict = None):
@@ -238,6 +239,13 @@ class SuiDataExtractor:
         extraction_time = time.time() - start_time
         self.logger.info(f"EXTRACTION COMPLETE: {len(results)} nodes analyzed in {extraction_time:.2f}s")
         
+        # Calculate batch-level metrics (checkpoint lag, transaction throughput)
+        try:
+            self.rpc_extractor.calculate_batch_metrics(results)
+            self.logger.info("Batch metrics calculation completed")
+        except Exception as e:
+            self.logger.error(f"Batch metrics calculation failed: {e}")
+        
         return results
 
     async def _extract_node_intelligence_async(self, node_data: Dict) -> SuiDataResult:
@@ -254,7 +262,8 @@ class SuiDataExtractor:
             port=get_primary_port(discovered_ports, node_type),
             timestamp=datetime.utcnow(),
             node_type=node_type,
-            network="unknown"
+            network="unknown",
+            hostname=node_data.get("hostname")
         )
         
         # Intelligence extraction pipeline using modular extractors
@@ -287,6 +296,13 @@ class SuiDataExtractor:
         # Calculate intelligence completeness
         result.data_completeness = successful_extractions / total_extractions if total_extractions > 0 else 0.0
         
+        # Capability-driven classification (before post-processing)
+        try:
+            self._classify_node_role(result)
+        except Exception as e:
+            self.logger.error(f"CLASSIFICATION ERROR: Node classification error for {ip}: {e}")
+            result.extraction_errors.append(f"classification_error: {str(e)}")
+        
         # Post-processing analysis with error handling
         try:
             await self._post_process_intelligence(result)
@@ -296,6 +312,84 @@ class SuiDataExtractor:
         
         self.logger.info(f"ANALYSIS COMPLETE: Intelligence extraction for {ip} complete: {result.data_completeness:.2f} completeness")
         return result
+
+    def _classify_node_role(self, result: SuiDataResult):
+        """Capability-driven node role classification as specified in requirements"""
+        
+        # Detect gRPC presence (TCP connect successful or full gRPC available)
+        grpc_detected = (
+            result.grpc_available or 
+            (hasattr(result, 'open_ports') and result.open_ports and 
+             result.open_ports.get('grpc', []))
+        )
+        
+        # Classification logic based on pure capabilities as specified
+        if result.has_narwhal_metrics or grpc_detected:
+            result.node_role = "validator"
+            self.logger.info(f"Node classified as VALIDATOR: Narwhal metrics={result.has_narwhal_metrics}, gRPC={grpc_detected}")
+                
+        elif result.rpc_status == "reachable":
+            result.node_role = "public_rpc"
+            self.logger.info(f"Node classified as PUBLIC_RPC: RPC reachable, no validator indicators")
+            
+        elif result.metrics_exposed:
+            result.node_role = "metrics"
+            self.logger.info(f"Node classified as METRICS: Metrics exposed, RPC not reachable")
+            
+        else:
+            result.node_role = "unknown"
+            self.logger.info(f"Node classified as UNKNOWN: No clear capabilities detected")
+            
+        # Additionally, check for hybrid classification
+        if result.rpc_status == "reachable" and result.has_narwhal_metrics:
+            result.node_role = "hybrid"
+            self.logger.info(f"Node reclassified as HYBRID: RPC reachable + Narwhal metrics")
+        
+        # Set narwhal_missing_reason based on role and capabilities
+        self._set_narwhal_missing_reason(result, grpc_detected)
+        
+        # Store classification evidence
+        result.metrics_snapshot["classification"] = {
+            "node_role": result.node_role,
+            "evidence": {
+                "rpc_reachable": result.rpc_status == "reachable",
+                "has_narwhal_metrics": result.has_narwhal_metrics,
+                "grpc_detected": grpc_detected,
+                "metrics_exposed": result.metrics_exposed
+            },
+            "narwhal_missing_reason": result.narwhal_missing_reason
+        }
+
+    def _set_narwhal_missing_reason(self, result: SuiDataResult, grpc_detected: bool):
+        """Set narwhal_missing_reason based on capability detection rules"""
+        
+        # Only set reason if narwhal metrics are missing
+        if result.has_narwhal_metrics:
+            result.narwhal_missing_reason = None  # No reason needed
+            return
+            
+        # Check if this is a validator-like node (has gRPC OR narwhal indicators)
+        is_validator_like = grpc_detected or result.has_narwhal_metrics
+        
+        if not is_validator_like:
+            result.narwhal_missing_reason = "not_validator_like"
+            return
+            
+        # Validator-like node but missing narwhal - check metrics accessibility
+        if result.metrics_exposed:
+            # Metrics are exposed but no narwhal data found
+            result.narwhal_missing_reason = "missing_metrics_data"
+        else:
+            # Check if metrics are gated vs closed
+            metrics_gated = any(
+                result.metrics_surface.get(str(port), {}).get("http_status") in ["401", "403"]
+                for port in [9184, 9100, 8080]
+            )
+            
+            if metrics_gated:
+                result.narwhal_missing_reason = "metrics_gated"
+            else:
+                result.narwhal_missing_reason = "metrics_closed"
 
     async def _post_process_intelligence(self, result: SuiDataResult):
         """Enhanced post-processing with node health assessment"""
@@ -327,6 +421,9 @@ class SuiDataExtractor:
         await self._validate_intelligence_consistency(result)
         await self._calculate_derived_metrics(result)
         
+        # Calculate network throughput (TPS & CPS)
+        await self._calculate_network_throughput(result)
+        
         # Additional validator-specific analysis
         if result.is_active_validator:
             result.metrics_snapshot["validator_confidence"] = "high" if result.metrics_exposed else "medium"
@@ -349,16 +446,44 @@ class SuiDataExtractor:
             health_score -= 0.4
             self.logger.warning(f"Multiple RPC endpoints unresponsive")
         
-        # Check metrics quality
+        # Check metrics quality - improved logic with better error categorization
         metrics_size = result.metrics_snapshot.get("size_bytes", 0)
-        if result.metrics_exposed and metrics_size == 0:
+        tdd_metrics_size = result.metrics_snapshot.get("tdd_metrics_size_bytes", 0)
+        
+        # Check for HTML error pages in metrics (not a health issue, just wrong endpoint)
+        has_html_error = (
+            result.metrics_snapshot.get("tdd_metrics_html_error", False) or
+            any(key.endswith("_html_error") for key in result.metrics_snapshot.keys())
+        )
+        
+        # Check for empty metrics responses
+        has_empty_metrics = (
+            result.metrics_snapshot.get("tdd_metrics_empty", False) or
+            any(key.endswith("_minimal_response") for key in result.metrics_snapshot.keys())
+        )
+        
+        if has_html_error:
+            health_issues.append("html_error_instead_of_metrics")
+            health_score -= 0.1  # Less severe - just wrong endpoint type
+            self.logger.warning(f"Metrics endpoints return HTML error pages instead of metrics")
+        elif has_empty_metrics:
             health_issues.append("empty_metrics_response")
+            health_score -= 0.2  # Moderate issue - endpoint exists but no data
+            self.logger.warning(f"Metrics endpoints return empty responses")
+        elif result.metrics_exposed and tdd_metrics_size == 0 and metrics_size == 0:
+            health_issues.append("no_metrics_data")
             health_score -= 0.3
-            self.logger.warning(f"Metrics endpoint returns empty data")
-        elif result.metrics_exposed and metrics_size < 1000:  # Very small metrics
-            health_issues.append("minimal_metrics_data")
-            health_score -= 0.2
-            self.logger.warning(f"Metrics endpoint returns minimal data ({metrics_size} bytes)")
+            self.logger.warning(f"Metrics endpoint returns no data")
+        elif result.metrics_exposed and (tdd_metrics_size < 1000 and metrics_size < 1000):  # Very small metrics
+            effective_size = max(tdd_metrics_size, metrics_size)
+            if effective_size > 10:  # If we have some data, it's less concerning
+                health_issues.append("minimal_metrics_data")
+                health_score -= 0.1  # Reduced penalty for minimal but present data
+                self.logger.warning(f"Metrics endpoint returns minimal data ({effective_size} bytes)")
+            else:
+                health_issues.append("empty_metrics_response") 
+                health_score -= 0.2
+                self.logger.warning(f"Metrics endpoint returns almost no data ({effective_size} bytes)")
         
         # Check for complete lack of blockchain intelligence
         blockchain_data_fields = [
@@ -390,12 +515,40 @@ class SuiDataExtractor:
             health_score -= 0.3
             self.logger.warning(f"Minimal service availability ({services_working}/5 services)")
         
-        # Check for extraction errors
-        if len(result.extraction_errors) > 3:
+        # Check for extraction errors - improved categorization
+        critical_errors = [err for err in result.extraction_errors if "critical_failure" in err]
+        html_errors = [err for err in result.extraction_errors if "html_error" in err]
+        connection_errors = [err for err in result.extraction_errors if any(term in err for term in ["connection", "timeout", "network"])]
+        
+        total_errors = len(result.extraction_errors)
+        
+        if len(critical_errors) > 2:
+            health_issues.append("multiple_critical_failures")
+            health_score -= 0.3  # Critical failures are more serious
+        elif len(html_errors) > 2:
+            health_issues.append("multiple_html_errors")
+            health_score -= 0.1  # HTML errors are less serious (wrong endpoint type)
+        elif len(connection_errors) > 2:
+            health_issues.append("multiple_connection_errors") 
+            health_score -= 0.2  # Connection errors are moderately serious
+        elif total_errors > 5:
             health_issues.append("multiple_extraction_errors")
-            health_score -= 0.2
+            health_score -= 0.15  # Reduced penalty for mixed error types
         
         # Determine overall health status
+        if health_score >= 0.8:
+            health_status = "healthy"
+        elif health_score >= 0.6:
+            health_status = "degraded"  
+        elif health_score >= 0.4:
+            health_status = "problematic"
+        else:
+            health_status = "critical"
+        
+        # Apply extend.md scoring criteria
+        health_score = await self._apply_extended_scoring(result, health_score, health_issues)
+        
+        # Re-evaluate health status after extended scoring
         if health_score >= 0.8:
             health_status = "healthy"
         elif health_score >= 0.6:
@@ -466,11 +619,141 @@ class SuiDataExtractor:
             result.max_response_time = max(response_times)
             result.min_response_time = min(response_times)
 
+    async def _calculate_network_throughput(self, result: SuiDataResult):
+        """Calculate TPS and CPS using ThroughputCalculator"""
+        try:
+            # If RPC is unreachable, set TPS/CPS to null as specified
+            if result.rpc_status == "unreachable":
+                result.network_throughput = {
+                    "tps": None,
+                    "cps": None,
+                    "calculation_window_seconds": None,
+                    "reason": "unreachable_rpc"
+                }
+                self.logger.info(f"Setting TPS/CPS to null for {result.ip}: RPC unreachable")
+                return
+            
+            # Extract required data from result
+            network = result.network if result.network != "unknown" else "mainnet"  # Default fallback
+            ip = result.ip
+            port = result.port
+            total_transactions = result.total_transactions
+            checkpoint_height = result.checkpoint_height
+            timestamp = result.timestamp
+            
+            # Calculate throughput using ThroughputCalculator (role-independent)
+            hostname = getattr(result, 'hostname', None)
+            throughput_data = self.throughput_calculator.calculate_throughput(
+                network=network,
+                ip=ip,
+                port=port,
+                total_transactions=total_transactions,
+                checkpoint_height=checkpoint_height,
+                timestamp=timestamp,
+                hostname=hostname
+            )
+            
+            # Store in result
+            result.network_throughput = throughput_data
+            
+            # Log successful calculation (but not null values)
+            if throughput_data.get("tps") is not None or throughput_data.get("cps") is not None:
+                self.logger.info(f"Throughput calculated for {ip}: TPS={throughput_data.get('tps')}, CPS={throughput_data.get('cps')}")
+            else:
+                self.logger.debug(f"Throughput calculation returned null values for {ip} (first observation or guardrails triggered)")
+                
+        except Exception as e:
+            self.logger.error(f"Failed to calculate network throughput for {result.ip}: {e}")
+            # Set default empty throughput data on error
+            result.network_throughput = {
+                "tps": None,
+                "cps": None, 
+                "calculation_window_seconds": None
+            }
+
+    async def _apply_extended_scoring(self, result: SuiDataResult, current_score: float, health_issues: List[str]) -> float:
+        """Apply scoring criteria from extend.md with public node classification"""
+        extended_score = current_score
+        
+        # Check if this is a public node (neutral scoring)
+        is_public = getattr(result, 'is_public_node', False)
+        
+        if is_public:
+            # Public nodes: neutral scoring for uptime, don't mark down for closed metrics
+            if result.metrics_surface and result.metrics_surface.get("http_status") == "closed":
+                # Public nodes with closed metrics: neutral (don't penalize)
+                result.metrics_snapshot["extended_scoring_neutral"] = "public_node_closed_metrics"
+                self.logger.info(f"Public node neutral scoring: Closed metrics are acceptable for public RPC providers")
+            elif result.metrics_surface and result.metrics_surface.get("http_status") in [401, 403]:
+                # Public nodes with gated metrics: neutral (don't penalize)
+                result.metrics_snapshot["extended_scoring_neutral"] = "public_node_gated_metrics"
+                self.logger.info(f"Public node neutral scoring: Gated metrics for public RPC provider")
+            
+            # Don't apply uptime penalties to public nodes
+            result.metrics_snapshot["extended_scoring_note"] = "public_node_uptime_neutral"
+            
+        else:
+            # Validator/private nodes: apply strict scoring
+            
+            # Mark down nodes that have no reachable RPC (cannot participate in network queries)
+            if result.rpc_status == "unreachable":
+                health_issues.append("rpc_unreachable_marked_down")
+                extended_score -= 0.3
+                self.logger.warning(f"Validator marked down: No reachable RPC endpoints")
+            
+            # Check for nodes that hide all uptime metrics while exposing other metrics publicly
+            # This indicates partial hardening, not full security
+            if result.metrics_exposed and result.uptime_status in ["unavailable_public_metrics", "closed"]:
+                # Check if other metrics are available
+                has_other_metrics = any(key in result.metrics_snapshot for key in [
+                    "sui_metrics_total", "consensus_metrics_count", "narwhal_metrics_count"
+                ])
+                if has_other_metrics:
+                    health_issues.append("partial_hardening_marked_down")
+                    extended_score -= 0.2
+                    self.logger.warning(f"Validator marked down: Hiding uptime metrics while exposing other metrics (partial hardening)")
+            
+            # Neutral scoring for nodes that gate metrics entirely (403/401) but have healthy RPC
+            if (result.rpc_status == "reachable" and 
+                not result.metrics_exposed and 
+                any(result.metrics_snapshot.get(f"port_{port}_gated", False) for port in [9184, 9100])):
+                # This is neutral - don't penalize or boost
+                result.metrics_snapshot["extended_scoring_neutral"] = "gated_metrics_healthy_rpc"
+                self.logger.info(f"Validator neutral scoring: Gated metrics but healthy RPC")
+            
+            # Mark up nodes that have both RPC and uptime metrics available and correct
+            if (result.rpc_status == "reachable" and 
+                result.uptime_status == "available" and 
+                result.uptime_seconds_total is not None):
+                health_issues.append("rpc_and_uptime_available_marked_up")
+                extended_score += 0.1  # Boost score for fully accessible nodes
+                self.logger.info(f"Validator marked up: Both RPC and uptime metrics are exposed and correct")
+        
+        # Store extended scoring metadata
+        result.metrics_snapshot["extended_scoring"] = {
+            "rpc_status": result.rpc_status,
+            "uptime_status": result.uptime_status,
+            "uptime_source": result.uptime_source,
+            "metrics_exposed": result.metrics_exposed,
+            "is_public_node": is_public,
+            "score_adjustment": round(extended_score - current_score, 2)
+        }
+        
+        return max(0.0, min(1.0, extended_score))  # Clamp between 0 and 1
+
     def export_data(self, results: List[SuiDataResult], pretty: bool = False) -> str:
-        """Export Sui data as flat JSON"""
-        if pretty:
-            return json.dumps([asdict(result) for result in results], indent=2, default=str)
-        return json.dumps([asdict(result) for result in results], separators=(',', ':'), default=str)
+        """Export Sui data using standard response format"""
+        data = [asdict(result) for result in results]
+        
+        response = standard_response(
+            data=data,
+            operation="data_extraction", 
+            data_type="sui_data",
+            stage="extract",
+            total_nodes=len(results)
+        )
+        
+        return format_json(response, pretty)
 
 
 # CLI Interface - maintaining the same entry point as original

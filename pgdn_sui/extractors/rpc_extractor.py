@@ -45,40 +45,49 @@ class RpcExtractor:
         self.timeout = timeout
         self.config = config or {}
         self.logger = logger
+    
+    def _build_rpc_permutations(self, ip: str) -> List[str]:
+        """Build RPC endpoint permutations exactly as specified in user requirements"""
+        # Schemes/ports: https://<host>[:443], https://<host>:9000, http://<host>:9000
+        base_urls = [
+            f"https://{ip}",      # https://<host> (default port 443)
+            f"https://{ip}:443",  # https://<host>:443
+            f"https://{ip}:9000", # https://<host>:9000
+            f"http://{ip}:9000",  # http://<host>:9000
+        ]
+        
+        # Paths to try per base: "/", "/rpc", "/json-rpc"
+        paths = ["/", "/rpc", "/json-rpc"]
+        
+        endpoints = []
+        for base_url in base_urls:
+            for path in paths:
+                endpoint = base_url + path
+                endpoints.append(endpoint)
+        
+        return endpoints
         
     async def extract_rpc_intelligence_async(self, result: SuiDataResult, ip: str, ports: List[int]) -> bool:
-        """Extract comprehensive intelligence via JSON-RPC with enhanced debugging"""
-        rpc_endpoints = []
+        """Extract comprehensive intelligence via JSON-RPC with enhanced debugging and extend.md permutations"""
         
-        # Build RPC endpoints based on discovered ports and common patterns
-        if 9000 in ports:
-            rpc_endpoints.extend([f"https://{ip}:9000", f"http://{ip}:9000"])
-        if 443 in ports:
-            rpc_endpoints.extend([f"https://{ip}", f"https://{ip}/rpc"])
-        if 80 in ports:
-            rpc_endpoints.extend([f"http://{ip}", f"http://{ip}/rpc"])
+        # Extended RPC endpoint permutations as specified in extend.md
+        rpc_endpoints = self._build_rpc_permutations(ip)
         
-        # Also try common patterns regardless of discovered ports
-        if not rpc_endpoints:
-            rpc_endpoints = [
-                f"https://{ip}:9000",
-                f"http://{ip}:9000",
-                f"https://{ip}",
-                f"http://{ip}",
-            ]
+        # Set initial RPC status
+        result.rpc_status = "unreachable"
         
         for endpoint in rpc_endpoints:
             try:
                 self.logger.info(f"Testing RPC endpoint: {endpoint}")
                 
-                # Test basic connectivity and authentication with detailed logging
+                # Test basic connectivity and authentication with short timeouts
                 start_time = time.time()
                 test_response = requests.post(endpoint, json={
                     "jsonrpc": "2.0",
                     "method": "sui_getChainIdentifier",
                     "params": [],
                     "id": 1
-                }, timeout=self.timeout, verify=False)
+                }, timeout=(1.5, 2.0), verify=False)  # connect=1.5s, read=2.0s, retries=1
                 
                 response_time = time.time() - start_time
                 result.service_response_times[f"rpc_{endpoint}"] = response_time
@@ -100,6 +109,9 @@ class RpcExtractor:
                         
                         if "result" in response_data and response_data["result"]:
                             self.logger.info(f"SUCCESS: RPC endpoint {endpoint} returned valid data: {response_data['result']}")
+                            
+                            # Set RPC status to reachable
+                            result.rpc_status = "reachable"
                             
                             # Process the chain identifier immediately
                             result.chain_identifier = str(response_data["result"])
@@ -124,6 +136,8 @@ class RpcExtractor:
                             # Some errors still indicate the node is working
                             if error_info.get("code") in [-32602, -32601]:  # Invalid params/method not found
                                 self.logger.info(f"PARTIAL: RPC endpoint {endpoint} is working but method not supported")
+                                # Set RPC status to reachable
+                                result.rpc_status = "reachable"
                                 # Try other methods on this endpoint
                                 await self._extract_comprehensive_rpc_intelligence(result, endpoint)
                                 return True
@@ -436,8 +450,30 @@ class RpcExtractor:
                     result.is_active_validator = True
                     result.validator_address = validator_info["address"]
                     result.validator_name = validator_info["name"]
-                    result.validator_stake = validator.get("stakingPoolSuiBalance")
-                    result.validator_commission_rate = validator.get("commissionRate")
+                    
+                    # Enhanced validator data extraction from prompt.md
+                    try:
+                        result.validator_stake = int(validator.get("stakingPoolSuiBalance", 0))
+                    except (ValueError, TypeError):
+                        result.validator_stake = 0
+                        
+                    try:
+                        result.validator_commission_rate = int(validator.get("commissionRate", 0))
+                    except (ValueError, TypeError):
+                        result.validator_commission_rate = 0
+                        
+                    try:
+                        result.validator_next_epoch_stake = int(validator.get("nextEpochStake", 0))
+                    except (ValueError, TypeError):
+                        result.validator_next_epoch_stake = 0
+                        
+                    try:
+                        # Extract validator rewards from validator info
+                        result.validator_rewards = int(validator.get("rewardsPool", 0))
+                    except (ValueError, TypeError):
+                        result.validator_rewards = 0
+                    
+                    self.logger.info(f"VALIDATOR IDENTIFIED: {result.validator_name} - Stake: {result.validator_stake}, Commission: {result.validator_commission_rate}%")
                     return
     
     def _check_ip_in_validator_field(self, ip: str, validator_info: Dict) -> bool:
@@ -458,3 +494,37 @@ class RpcExtractor:
         if network_addr and ip in network_addr:
             return True
         return False
+
+    def calculate_batch_metrics(self, results: List[SuiDataResult]):
+        """Calculate checkpoint lag and transaction throughput across the scan batch"""
+        if not results:
+            return
+            
+        # Find maximum checkpoint in the batch
+        max_checkpoint = 0
+        checkpoint_nodes = []
+        
+        for result in results:
+            if result.checkpoint_height and result.checkpoint_height > max_checkpoint:
+                max_checkpoint = result.checkpoint_height
+            if result.checkpoint_height:
+                checkpoint_nodes.append(result)
+        
+        if max_checkpoint > 0:
+            # Calculate checkpoint lag for each node
+            for result in results:
+                if result.checkpoint_height:
+                    result.checkpoint_lag = max_checkpoint - result.checkpoint_height
+                    self.logger.info(f"Node {result.ip} checkpoint lag: {result.checkpoint_lag} blocks")
+        
+        # Calculate transaction throughput TPS from delta (if we had previous scan data)
+        # For now, store the transaction counts for future delta calculations
+        for result in results:
+            if result.total_transactions:
+                result.metrics_snapshot["transaction_count_for_delta"] = {
+                    "count": result.total_transactions,
+                    "timestamp": time.time(),
+                    "checkpoint": result.checkpoint_height
+                }
+                
+        self.logger.info(f"Batch analysis complete: max checkpoint {max_checkpoint}, {len(checkpoint_nodes)} nodes with checkpoint data")
