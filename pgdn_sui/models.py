@@ -17,6 +17,7 @@ class SuiDataResult:
     timestamp: datetime
     node_type: str
     network: str
+    hostname: Optional[str] = None
     
     # Core Sui blockchain data
     sui_version: Optional[str] = None
@@ -61,8 +62,14 @@ class SuiDataResult:
     # Uptime classification and edge-aware policy
     uptime_status: Optional[str] = None  # "available", "unavailable_public_metrics", "gated", "closed"
     uptime_expected: Optional[bool] = None  # False for edge nodes
+    uptime_source: Optional[str] = None  # "node_exporter" for node_boot_time_seconds (extend.md requirement)
     edge: Optional[bool] = None  # True for provider edge nodes
     uptime_evidence: Optional[str] = None  # Evidence string ≤128 chars
+    
+    # Public node classification
+    is_public_node: Optional[bool] = None  # True for known public RPC providers
+    public_node_provider: Optional[str] = None  # Provider name if detected (e.g., "onfinality", "chainstack")
+    metrics_surface: Optional[Dict[str, Any]] = None  # HTTP status and access patterns
     
     # Enhanced network intelligence
     network_peers: Optional[int] = None 
@@ -77,6 +84,7 @@ class SuiDataResult:
     # Service availability intelligence
     rpc_exposed: bool = False
     rpc_authenticated: bool = False
+    rpc_status: Optional[str] = None  # "reachable", "unreachable" (extend.md requirement)
     rpc_methods_available: List[str] = None
     websocket_available: bool = False
     graphql_available: bool = False
@@ -146,3 +154,5 @@ class SuiDataResult:
             self.extraction_errors = []
         if self.network_throughput is None:
             self.network_throughput = {}
+        if self.metrics_surface is None:
+            self.metrics_surface = {}

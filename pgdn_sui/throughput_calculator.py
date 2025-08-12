@@ -88,9 +88,15 @@ class ThroughputCalculator:
         except Exception as e:
             logger.error(f"Failed to save state: {e}")
     
-    def _create_key(self, network: str, node_type: str, ip: str, port: int) -> str:
-        """Create unique key for node state."""
-        return f"{network}|{node_type}|{ip}|{port}"
+    def _create_key(self, network: str, node_type: str, ip: str, port: int, hostname: Optional[str] = None) -> str:
+        """
+        Create stable unique key for node state.
+        Format: <network>|<node_type>|<ip>|<port>
+        Uses hostname if available for better stability, otherwise falls back to IP.
+        """
+        # Use hostname if available for more stable identification
+        identifier = hostname if hostname and hostname != ip else ip
+        return f"{network}|{node_type}|{identifier}|{port}"
     
     def _convert_timestamp_to_epoch(self, timestamp: Any) -> float:
         """
@@ -121,7 +127,8 @@ class ThroughputCalculator:
                            port: int,
                            total_transactions: Optional[int],
                            checkpoint_height: Optional[int], 
-                           timestamp: Any) -> Dict[str, Optional[float]]:
+                           timestamp: Any,
+                           hostname: Optional[str] = None) -> Dict[str, Optional[float]]:
         """
         Calculate TPS and CPS for a node based on current and previous observations.
         
@@ -133,11 +140,12 @@ class ThroughputCalculator:
             total_transactions: Current total transaction count
             checkpoint_height: Current checkpoint height
             timestamp: Current timestamp (datetime, RFC3339 string, or epoch seconds)
+            hostname: Optional hostname for more stable identification
         
         Returns:
             Dict with tps, cps, and calculation_window_seconds (may contain nulls)
         """
-        key = self._create_key(network, node_type, ip, port)
+        key = self._create_key(network, node_type, ip, port, hostname)
         ts_now = self._convert_timestamp_to_epoch(timestamp)
         
         # Initialize result
@@ -175,35 +183,43 @@ class ThroughputCalculator:
         
         result["calculation_window_seconds"] = round(delta_t, 2)
         
-        # Apply guardrails
+        # Apply guardrails - require Δt >= 1s as specified
         if delta_t < 1.0:
-            logger.debug(f"Delta time too small ({delta_t:.2f}s), setting metrics to null")
-            # Don't update state if time delta is too small
+            logger.debug(f"Delta time too small ({delta_t:.2f}s < 1s), setting TPS/CPS to null")
+            # Don't update state if time delta is too small - preserve for next calculation
             return result
         
-        # Calculate TPS
-        if delta_tx is not None:
+        # Calculate TPS with enhanced guardrails
+        if delta_tx is not None and total_transactions is not None and prev_snapshot.get('total_transactions') is not None:
             if delta_tx < 0:
                 logger.warning(f"Transaction counter reset detected for {key} (Δtx={delta_tx})")
                 result["tps"] = None
+            elif delta_tx == 0:
+                # No new transactions - legitimate 0 TPS
+                result["tps"] = 0.0
             else:
+                # Round to 2 decimal places as specified
                 result["tps"] = round(delta_tx / delta_t, 2)
                 
-                # Quality check for TPS
-                if result["tps"] < 0 or result["tps"] > 10_000:
-                    logger.debug(f"TPS sanity check: unusual TPS value {result['tps']} for {key}")
+                # Quality check for TPS (allow 0, flag unusual high values)
+                if result["tps"] > 50_000:  # Very high TPS threshold
+                    logger.warning(f"TPS sanity check: unusually high TPS value {result['tps']} for {key}")
         
-        # Calculate CPS  
-        if delta_cp is not None:
+        # Calculate CPS with enhanced guardrails
+        if delta_cp is not None and checkpoint_height is not None and prev_snapshot.get('checkpoint_height') is not None:
             if delta_cp < 0:
                 logger.warning(f"Checkpoint counter reset detected for {key} (Δcp={delta_cp})")
                 result["cps"] = None
+            elif delta_cp == 0:
+                # No new checkpoints - legitimate 0 CPS
+                result["cps"] = 0.0
             else:
+                # Round to 2 decimal places as specified
                 result["cps"] = round(delta_cp / delta_t, 2)
                 
-                # Quality check for CPS
-                if result["cps"] > 10 or result["cps"] < 0:
-                    logger.debug(f"CPS sanity check: unusual CPS value {result['cps']} for {key}")
+                # Quality check for CPS (checkpoints are typically slower)
+                if result["cps"] > 50:  # Very high CPS threshold
+                    logger.warning(f"CPS sanity check: unusually high CPS value {result['cps']} for {key}")
         
         # Atomically update state after calculation
         if total_transactions is not None and checkpoint_height is not None:
