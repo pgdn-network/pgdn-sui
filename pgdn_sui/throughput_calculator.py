@@ -88,15 +88,16 @@ class ThroughputCalculator:
         except Exception as e:
             logger.error(f"Failed to save state: {e}")
     
-    def _create_key(self, network: str, node_type: str, ip: str, port: int, hostname: Optional[str] = None) -> str:
+    def _create_key(self, network: str, hostname_or_ip: str, port: int) -> str:
         """
-        Create stable unique key for node state.
-        Format: <network>|<node_type>|<ip>|<port>
-        Uses hostname if available for better stability, otherwise falls back to IP.
+        Create STABLE delta key that ignores role changes.
+        Format: <network>|<hostname_or_ip>|<port>
+        Uses hostname if available for better stability, otherwise IP.
+        Normalized to lowercase for consistency.
         """
-        # Use hostname if available for more stable identification
-        identifier = hostname if hostname and hostname != ip else ip
-        return f"{network}|{node_type}|{identifier}|{port}"
+        # Normalize hostname/IP to lowercase for consistent matching
+        identifier = hostname_or_ip.lower().strip()
+        return f"{network}|{identifier}|{port}"
     
     def _convert_timestamp_to_epoch(self, timestamp: Any) -> float:
         """
@@ -122,7 +123,6 @@ class ThroughputCalculator:
     
     def calculate_throughput(self, 
                            network: str, 
-                           node_type: str, 
                            ip: str, 
                            port: int,
                            total_transactions: Optional[int],
@@ -131,28 +131,31 @@ class ThroughputCalculator:
                            hostname: Optional[str] = None) -> Dict[str, Optional[float]]:
         """
         Calculate TPS and CPS for a node based on current and previous observations.
+        Uses STABLE delta key that ignores role changes.
         
         Args:
             network: Network name (mainnet, testnet, devnet)
-            node_type: Node type (validator, public_rpc, etc.)
             ip: Node IP address
             port: Node port
             total_transactions: Current total transaction count
             checkpoint_height: Current checkpoint height
             timestamp: Current timestamp (datetime, RFC3339 string, or epoch seconds)
-            hostname: Optional hostname for more stable identification
+            hostname: Optional hostname for more stable identification (preferred over IP)
         
         Returns:
-            Dict with tps, cps, and calculation_window_seconds (may contain nulls)
+            Dict with tps, cps, calculation_window_seconds, and reason (may contain nulls)
         """
-        key = self._create_key(network, node_type, ip, port, hostname)
+        # Use hostname if available, otherwise fallback to IP
+        hostname_or_ip = hostname if hostname and hostname != ip else ip
+        key = self._create_key(network, hostname_or_ip, port)
         ts_now = self._convert_timestamp_to_epoch(timestamp)
         
         # Initialize result
         result = {
             "tps": None,
             "cps": None, 
-            "calculation_window_seconds": None
+            "calculation_window_seconds": None,
+            "reason": None
         }
         
         # Get previous snapshot
@@ -160,7 +163,8 @@ class ThroughputCalculator:
         
         if not prev_snapshot:
             logger.debug(f"No previous snapshot for {key}, storing first observation")
-            # Store first observation, return nulls
+            # Store first observation, return nulls with reason
+            result["reason"] = "no_previous_data"
             if total_transactions is not None and checkpoint_height is not None:
                 self.state[key] = {
                     "total_transactions": total_transactions,
@@ -168,6 +172,8 @@ class ThroughputCalculator:
                     "ts_s": ts_now
                 }
                 self._save_state()
+            else:
+                result["reason"] = "missing_counters"
             return result
         
         # Calculate deltas
@@ -186,20 +192,27 @@ class ThroughputCalculator:
         # Apply guardrails - require Δt >= 1s as specified
         if delta_t < 1.0:
             logger.debug(f"Delta time too small ({delta_t:.2f}s < 1s), setting TPS/CPS to null")
+            result["reason"] = "interval_too_short"
             # Don't update state if time delta is too small - preserve for next calculation
             return result
+        
+        # Track if we have any valid calculations
+        has_calculations = False
         
         # Calculate TPS with enhanced guardrails
         if delta_tx is not None and total_transactions is not None and prev_snapshot.get('total_transactions') is not None:
             if delta_tx < 0:
                 logger.warning(f"Transaction counter reset detected for {key} (Δtx={delta_tx})")
                 result["tps"] = None
+                result["reason"] = "counter_reset"
             elif delta_tx == 0:
                 # No new transactions - legitimate 0 TPS
                 result["tps"] = 0.0
+                has_calculations = True
             else:
                 # Round to 2 decimal places as specified
                 result["tps"] = round(delta_tx / delta_t, 2)
+                has_calculations = True
                 
                 # Quality check for TPS (allow 0, flag unusual high values)
                 if result["tps"] > 50_000:  # Very high TPS threshold
@@ -210,16 +223,27 @@ class ThroughputCalculator:
             if delta_cp < 0:
                 logger.warning(f"Checkpoint counter reset detected for {key} (Δcp={delta_cp})")
                 result["cps"] = None
+                if not result["reason"]:  # Only set if not already set by TPS
+                    result["reason"] = "counter_reset"
             elif delta_cp == 0:
                 # No new checkpoints - legitimate 0 CPS
                 result["cps"] = 0.0
+                has_calculations = True
             else:
                 # Round to 2 decimal places as specified
                 result["cps"] = round(delta_cp / delta_t, 2)
+                has_calculations = True
                 
                 # Quality check for CPS (checkpoints are typically slower)
                 if result["cps"] > 50:  # Very high CPS threshold
                     logger.warning(f"CPS sanity check: unusually high CPS value {result['cps']} for {key}")
+        
+        # Set reason if no calculations could be made
+        if not has_calculations and not result["reason"]:
+            if total_transactions is None or checkpoint_height is None:
+                result["reason"] = "missing_counters"
+            else:
+                result["reason"] = "missing_counters"
         
         # Atomically update state after calculation
         if total_transactions is not None and checkpoint_height is not None:

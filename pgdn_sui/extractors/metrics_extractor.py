@@ -42,13 +42,18 @@ class MetricsExtractor:
         return tdd_success or comprehensive_success
     
     async def _extract_dual_port_metrics(self, result: SuiDataResult, ip: str) -> bool:
-        """Extract metrics from dual ports (:9184 and :9100) as specified in extend.md"""
+        """Extract metrics from multiple ports with full permutation coverage"""
         
-        # Try both ports as specified in extend.md
+        # Ports/paths to try as specified: 9184/metrics (Sui app), 9100/metrics (node-exporter), 8080/metrics (some setups)
         metrics_ports = [
             {"port": 9184, "type": "sui_app", "url": f"http://{ip}:9184/metrics"},
-            {"port": 9100, "type": "node_exporter", "url": f"http://{ip}:9100/metrics"}
+            {"port": 9100, "type": "node_exporter", "url": f"http://{ip}:9100/metrics"},
+            {"port": 8080, "type": "metrics_alt", "url": f"http://{ip}:8080/metrics"}
         ]
+        
+        # Initialize metrics_surface to track all attempts
+        if result.metrics_surface is None:
+            result.metrics_surface = {}
         
         for port_info in metrics_ports:
             try:
@@ -57,12 +62,17 @@ class MetricsExtractor:
                 
                 response = requests.get(
                     port_info["url"],
-                    timeout=(2, 2),  # (connect_timeout, read_timeout)
+                    timeout=(1.5, 2.0),  # connect=1.5s, read=2.0s, retries=1
                     headers=headers,
                     verify=False
                 )
                 
                 response_time = time.time() - start_time
+                
+                # Track this attempt in metrics_surface
+                result.metrics_surface[str(port_info["port"])] = {
+                    "http_status": str(response.status_code)
+                }
                 
                 if response.status_code == 200:
                     metrics_text = response.text
@@ -100,20 +110,24 @@ class MetricsExtractor:
                         self.logger.debug(f"Invalid metrics response from {port_info['url']}")
                         
                 elif response.status_code in [401, 403]:
-                    # Gated metrics
+                    # Gated metrics - already tracked in metrics_surface above
                     result.metrics_snapshot[f"port_{port_info['port']}_gated"] = True
                     self.logger.info(f"Metrics gated on port {port_info['port']} (HTTP {response.status_code})")
                     
                 elif response.status_code == 404:
-                    # Closed metrics
+                    # Closed metrics - already tracked in metrics_surface above  
                     result.metrics_snapshot[f"port_{port_info['port']}_closed"] = True
                     self.logger.debug(f"Metrics endpoint not found on port {port_info['port']} (HTTP 404)")
                     
             except requests.exceptions.Timeout:
+                # Track timeout in metrics_surface as "closed"
+                result.metrics_surface[str(port_info["port"])] = {"http_status": "closed"}
                 result.metrics_snapshot[f"port_{port_info['port']}_timeout"] = True
                 self.logger.debug(f"Metrics timeout on port {port_info['port']}")
                 
             except requests.exceptions.ConnectionError as e:
+                # Track connection errors in metrics_surface as "closed"
+                result.metrics_surface[str(port_info["port"])] = {"http_status": "closed"}
                 if "Connection refused" in str(e):
                     result.metrics_snapshot[f"port_{port_info['port']}_connection_refused"] = True
                     self.logger.debug(f"Metrics connection refused on port {port_info['port']}")
@@ -121,9 +135,18 @@ class MetricsExtractor:
                     self.logger.debug(f"Metrics connection error on port {port_info['port']}: {e}")
                     
             except Exception as e:
+                # Track other errors in metrics_surface as "closed"
+                result.metrics_surface[str(port_info["port"])] = {"http_status": "closed"}
                 self.logger.debug(f"Metrics extraction error on port {port_info['port']}: {e}")
         
-        # No successful metrics extraction from either port
+        # No successful metrics extraction from any port
+        # Set metrics_exposed=true only if we got at least one 200 response with non-empty body
+        any_200_with_body = any(
+            result.metrics_surface.get(str(port_info["port"]), {}).get("http_status") == "200"
+            for port_info in metrics_ports
+        )
+        result.metrics_exposed = any_200_with_body
+        
         return False
     
     def _is_valid_metrics_response(self, metrics_text: str) -> bool:
@@ -709,9 +732,34 @@ class MetricsExtractor:
         result.metrics_snapshot["blockchain_metrics_extracted"] = metrics_extracted
         self.logger.info(f"Extracted {metrics_extracted} blockchain metrics")
         
+        # Detect Narwhal/consensus metrics for capability-based classification
+        result.has_narwhal_metrics = self._detect_narwhal_metrics(metrics_text)
+        if result.has_narwhal_metrics:
+            self.logger.info("Narwhal/consensus metrics detected - likely validator node")
+        
         # Calculate derived metrics
         await self._calculate_transaction_throughput(result, metrics_text)
         await self._calculate_checkpoint_lag(result)
+
+    def _detect_narwhal_metrics(self, metrics_text: str) -> bool:
+        """Detect presence of Narwhal/consensus metrics for capability classification"""
+        narwhal_patterns = [
+            r'narwhal_\w+',
+            r'consensus_\w+',
+            r'consensus_round\s+\d+',
+            r'narwhal_primary_network_peers\s+\d+',
+            r'narwhal_certificate_created_total\s+\d+',
+            r'consensus_commit_latency_seconds\s+[0-9.]+',
+            r'consensus_proposals_in_queue\s+\d+',
+        ]
+        
+        narwhal_indicators = 0
+        for pattern in narwhal_patterns:
+            matches = re.findall(pattern, metrics_text, re.IGNORECASE)
+            narwhal_indicators += len(matches)
+        
+        # If we find 2 or more narwhal/consensus indicators, consider it present
+        return narwhal_indicators >= 2
 
     async def _detect_validator_evidence_from_metrics(self, result: SuiDataResult, metrics_text: str) -> Dict:
         """Detect evidence that this node is a validator from metrics"""
@@ -1009,20 +1057,7 @@ class MetricsExtractor:
         """
         edge_indicators = []
         
-        # Check for public RPC hostname patterns (common cloud/CDN providers)
-        public_rpc_patterns = [
-            r'.*\.amazonaws\.com$',
-            r'.*\.cloudflare\.com$', 
-            r'.*\.google\.com$',
-            r'.*\.azure\.com$',
-            r'.*rpc.*\.com$',
-            r'.*api.*\.com$',
-            r'.*gateway.*\.com$',
-            r'.*sui.*rpc.*',
-        ]
-        
-        # Note: In real implementation, we'd need the actual hostname, not just IP
-        # For now, we'll rely on other indicators
+        # Hard-coded hostname patterns removed - edge detection now purely capability-based
         
         # Check for CDN/Load Balancer headers
         if headers:
@@ -1092,26 +1127,8 @@ class MetricsExtractor:
         # Get hostname from result if available (would need to be set by caller)
         hostname = getattr(result, 'hostname', None) or ip
         
-        # Known public RPC provider patterns
-        provider_patterns = {
-            "sui_foundation": [r'.*\.sui\.io$', r'.*sui-.*\.com$'],
-            "onfinality": [r'.*\.onfinality\.io$', r'.*onfinality.*\.com$'],
-            "chainstack": [r'.*\.chainstack\.com$', r'.*chainstack.*\.io$'],
-            "alchemy": [r'.*\.alchemy\.com$', r'.*alchemy.*\.io$'],
-            "blockdaemon": [r'.*\.blockdaemon\.com$', r'.*blockdaemon.*\.io$'],
-            "quicknode": [r'.*\.quicknode\.pro$', r'.*quicknode.*\.com$'],
-            "ankr": [r'.*\.ankr\.com$', r'.*ankr.*\.io$'],
-            "nodereal": [r'.*\.nodereal\.io$', r'.*nodereal.*\.com$'],
-            "public_rpc": [r'.*rpc.*\.com$', r'.*api.*\.com$', r'.*gateway.*\.com$', r'.*node.*\.com$']
-        }
-        
-        # Check hostname against known patterns
-        for provider, patterns in provider_patterns.items():
-            for pattern in patterns:
-                if re.search(pattern, hostname, re.IGNORECASE):
-                    public_indicators.append(f"hostname_pattern:{provider}")
-                    if not provider_name:  # Use first match as primary provider
-                        provider_name = provider
+        # Provider patterns removed - classification now purely capability-based
+        # No hostname-based provider detection
         
         # Check for CDN/Load Balancer headers (indicates infrastructure provider)
         cdn_detected = False
@@ -1148,10 +1165,12 @@ class MetricsExtractor:
         if not validator_metrics_present:
             public_indicators.append("no_validator_metrics")
         
-        # Classification logic: known provider OR (CDN + no gRPC)
+        # Classification logic: capability-based only (CDN + no gRPC + no validator metrics)
+        
         is_public = (
-            len([i for i in public_indicators if "hostname_pattern" in i]) > 0 or
-            (cdn_detected and not result.grpc_available)
+            cdn_detected and 
+            not result.grpc_available and
+            not validator_metrics_present
         )
         
         if is_public:

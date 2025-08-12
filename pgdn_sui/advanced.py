@@ -49,16 +49,7 @@ class SuiDataExtractor:
     Enhanced Sui node interrogator with native protocol support
     """
     
-    # Enhanced Sui port intelligence
-    SUI_PORT_INTEL = {
-        9000: {"name": "JSON-RPC", "expected_for": ["public_rpc", "hybrid", "validator"], "critical": True},
-        9100: {"name": "Prometheus", "expected_for": ["validator", "hybrid"], "critical": False}, 
-        8080: {"name": "gRPC", "expected_for": ["validator", "hybrid"], "critical": True},
-        50051: {"name": "Consensus-gRPC", "expected_for": ["validator", "hybrid"], "critical": True},
-        9184: {"name": "WebSocket", "expected_for": ["public_rpc", "hybrid"], "critical": False},
-        3030: {"name": "GraphQL", "expected_for": ["public_rpc", "hybrid"], "critical": False},
-        8084: {"name": "Indexer", "expected_for": ["indexer", "hybrid"], "critical": False},
-    }
+    # Port intelligence removed - now using capability-first probing approach
     
     def __init__(self, config: Dict = None):
         self.config = config or {}
@@ -305,6 +296,13 @@ class SuiDataExtractor:
         # Calculate intelligence completeness
         result.data_completeness = successful_extractions / total_extractions if total_extractions > 0 else 0.0
         
+        # Capability-driven classification (before post-processing)
+        try:
+            self._classify_node_role(result)
+        except Exception as e:
+            self.logger.error(f"CLASSIFICATION ERROR: Node classification error for {ip}: {e}")
+            result.extraction_errors.append(f"classification_error: {str(e)}")
+        
         # Post-processing analysis with error handling
         try:
             await self._post_process_intelligence(result)
@@ -314,6 +312,84 @@ class SuiDataExtractor:
         
         self.logger.info(f"ANALYSIS COMPLETE: Intelligence extraction for {ip} complete: {result.data_completeness:.2f} completeness")
         return result
+
+    def _classify_node_role(self, result: SuiDataResult):
+        """Capability-driven node role classification as specified in requirements"""
+        
+        # Detect gRPC presence (TCP connect successful or full gRPC available)
+        grpc_detected = (
+            result.grpc_available or 
+            (hasattr(result, 'open_ports') and result.open_ports and 
+             result.open_ports.get('grpc', []))
+        )
+        
+        # Classification logic based on pure capabilities as specified
+        if result.has_narwhal_metrics or grpc_detected:
+            result.node_role = "validator"
+            self.logger.info(f"Node classified as VALIDATOR: Narwhal metrics={result.has_narwhal_metrics}, gRPC={grpc_detected}")
+                
+        elif result.rpc_status == "reachable":
+            result.node_role = "public_rpc"
+            self.logger.info(f"Node classified as PUBLIC_RPC: RPC reachable, no validator indicators")
+            
+        elif result.metrics_exposed:
+            result.node_role = "metrics"
+            self.logger.info(f"Node classified as METRICS: Metrics exposed, RPC not reachable")
+            
+        else:
+            result.node_role = "unknown"
+            self.logger.info(f"Node classified as UNKNOWN: No clear capabilities detected")
+            
+        # Additionally, check for hybrid classification
+        if result.rpc_status == "reachable" and result.has_narwhal_metrics:
+            result.node_role = "hybrid"
+            self.logger.info(f"Node reclassified as HYBRID: RPC reachable + Narwhal metrics")
+        
+        # Set narwhal_missing_reason based on role and capabilities
+        self._set_narwhal_missing_reason(result, grpc_detected)
+        
+        # Store classification evidence
+        result.metrics_snapshot["classification"] = {
+            "node_role": result.node_role,
+            "evidence": {
+                "rpc_reachable": result.rpc_status == "reachable",
+                "has_narwhal_metrics": result.has_narwhal_metrics,
+                "grpc_detected": grpc_detected,
+                "metrics_exposed": result.metrics_exposed
+            },
+            "narwhal_missing_reason": result.narwhal_missing_reason
+        }
+
+    def _set_narwhal_missing_reason(self, result: SuiDataResult, grpc_detected: bool):
+        """Set narwhal_missing_reason based on capability detection rules"""
+        
+        # Only set reason if narwhal metrics are missing
+        if result.has_narwhal_metrics:
+            result.narwhal_missing_reason = None  # No reason needed
+            return
+            
+        # Check if this is a validator-like node (has gRPC OR narwhal indicators)
+        is_validator_like = grpc_detected or result.has_narwhal_metrics
+        
+        if not is_validator_like:
+            result.narwhal_missing_reason = "not_validator_like"
+            return
+            
+        # Validator-like node but missing narwhal - check metrics accessibility
+        if result.metrics_exposed:
+            # Metrics are exposed but no narwhal data found
+            result.narwhal_missing_reason = "missing_metrics_data"
+        else:
+            # Check if metrics are gated vs closed
+            metrics_gated = any(
+                result.metrics_surface.get(str(port), {}).get("http_status") in ["401", "403"]
+                for port in [9184, 9100, 8080]
+            )
+            
+            if metrics_gated:
+                result.narwhal_missing_reason = "metrics_gated"
+            else:
+                result.narwhal_missing_reason = "metrics_closed"
 
     async def _post_process_intelligence(self, result: SuiDataResult):
         """Enhanced post-processing with node health assessment"""
@@ -546,31 +622,29 @@ class SuiDataExtractor:
     async def _calculate_network_throughput(self, result: SuiDataResult):
         """Calculate TPS and CPS using ThroughputCalculator"""
         try:
-            # If RPC is unreachable, set TPS/CPS to null as specified in extend.md
+            # If RPC is unreachable, set TPS/CPS to null as specified
             if result.rpc_status == "unreachable":
                 result.network_throughput = {
                     "tps": None,
                     "cps": None,
                     "calculation_window_seconds": None,
-                    "reason": "rpc_unreachable"
+                    "reason": "unreachable_rpc"
                 }
                 self.logger.info(f"Setting TPS/CPS to null for {result.ip}: RPC unreachable")
                 return
             
             # Extract required data from result
             network = result.network if result.network != "unknown" else "mainnet"  # Default fallback
-            node_type = result.node_type
             ip = result.ip
             port = result.port
             total_transactions = result.total_transactions
             checkpoint_height = result.checkpoint_height
             timestamp = result.timestamp
             
-            # Calculate throughput using ThroughputCalculator
+            # Calculate throughput using ThroughputCalculator (role-independent)
             hostname = getattr(result, 'hostname', None)
             throughput_data = self.throughput_calculator.calculate_throughput(
                 network=network,
-                node_type=node_type,
                 ip=ip,
                 port=port,
                 total_transactions=total_transactions,

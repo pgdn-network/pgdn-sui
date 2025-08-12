@@ -122,6 +122,14 @@ class SuiDataResult:
     
     # Network throughput metrics (TPS & CPS)
     network_throughput: Optional[Dict[str, Optional[float]]] = None
+    
+    # Open ports detected via TCP connect (for gRPC detection)
+    open_ports: Optional[Dict[str, List[int]]] = None
+    
+    # Capability-driven node role classification
+    node_role: Optional[str] = None  # validator, public_rpc, metrics, hybrid, unknown
+    has_narwhal_metrics: bool = False
+    narwhal_missing_reason: Optional[str] = None  # not_validator_like, metrics_closed, metrics_gated, missing_metrics_data
 
     def __post_init__(self):
         if self.peer_info is None:
@@ -156,3 +164,5 @@ class SuiDataResult:
             self.network_throughput = {}
         if self.metrics_surface is None:
             self.metrics_surface = {}
+        if self.open_ports is None:
+            self.open_ports = {}
