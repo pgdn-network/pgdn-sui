@@ -17,6 +17,7 @@ from .models import SuiDataResult
 from .protobuf_manager import SuiProtobufManager
 from .utils import get_primary_port, calculate_gini_coefficient
 from .response_format import standard_response, format_json
+from .throughput_calculator import ThroughputCalculator
 from .extractors import (
     RpcExtractor, 
     GrpcExtractor, 
@@ -95,6 +96,12 @@ class SuiDataExtractor:
         self.graphql_extractor = GraphqlExtractor(self.timeout, self.config)
         self.websocket_extractor = WebsocketExtractor(self.timeout, self.config)
         self.sui_client_extractor = SuiClientExtractor(self.timeout, self.config, self.sui_client)
+        
+        # Initialize throughput calculator
+        self.throughput_calculator = ThroughputCalculator(
+            state_file_path=self.config.get('throughput_state_file'),
+            ttl_hours=self.config.get('throughput_ttl_hours', 24)
+        )
 
     @classmethod
     def from_discovery_json(cls, json_file_path: str, config: Dict = None):
@@ -239,6 +246,13 @@ class SuiDataExtractor:
         extraction_time = time.time() - start_time
         self.logger.info(f"EXTRACTION COMPLETE: {len(results)} nodes analyzed in {extraction_time:.2f}s")
         
+        # Calculate batch-level metrics (checkpoint lag, transaction throughput)
+        try:
+            self.rpc_extractor.calculate_batch_metrics(results)
+            self.logger.info("Batch metrics calculation completed")
+        except Exception as e:
+            self.logger.error(f"Batch metrics calculation failed: {e}")
+        
         return results
 
     async def _extract_node_intelligence_async(self, node_data: Dict) -> SuiDataResult:
@@ -327,6 +341,9 @@ class SuiDataExtractor:
         # Standard validations
         await self._validate_intelligence_consistency(result)
         await self._calculate_derived_metrics(result)
+        
+        # Calculate network throughput (TPS & CPS)
+        await self._calculate_network_throughput(result)
         
         # Additional validator-specific analysis
         if result.is_active_validator:
@@ -466,6 +483,47 @@ class SuiDataExtractor:
             result.avg_response_time = sum(response_times) / len(response_times)
             result.max_response_time = max(response_times)
             result.min_response_time = min(response_times)
+
+    async def _calculate_network_throughput(self, result: SuiDataResult):
+        """Calculate TPS and CPS using ThroughputCalculator"""
+        try:
+            # Extract required data from result
+            network = result.network if result.network != "unknown" else "mainnet"  # Default fallback
+            node_type = result.node_type
+            ip = result.ip
+            port = result.port
+            total_transactions = result.total_transactions
+            checkpoint_height = result.checkpoint_height
+            timestamp = result.timestamp
+            
+            # Calculate throughput using ThroughputCalculator
+            throughput_data = self.throughput_calculator.calculate_throughput(
+                network=network,
+                node_type=node_type,
+                ip=ip,
+                port=port,
+                total_transactions=total_transactions,
+                checkpoint_height=checkpoint_height,
+                timestamp=timestamp
+            )
+            
+            # Store in result
+            result.network_throughput = throughput_data
+            
+            # Log successful calculation (but not null values)
+            if throughput_data.get("tps") is not None or throughput_data.get("cps") is not None:
+                self.logger.info(f"Throughput calculated for {ip}: TPS={throughput_data.get('tps')}, CPS={throughput_data.get('cps')}")
+            else:
+                self.logger.debug(f"Throughput calculation returned null values for {ip} (first observation or guardrails triggered)")
+                
+        except Exception as e:
+            self.logger.error(f"Failed to calculate network throughput for {result.ip}: {e}")
+            # Set default empty throughput data on error
+            result.network_throughput = {
+                "tps": None,
+                "cps": None, 
+                "calculation_window_seconds": None
+            }
 
     def export_data(self, results: List[SuiDataResult], pretty: bool = False) -> str:
         """Export Sui data using standard response format"""

@@ -45,7 +45,24 @@ class SuiDataResult:
     narwhal_certificate_created: Optional[int] = None
     consensus_latency_ms: Optional[float] = None
     consensus_commit_latency: Optional[float] = None
+    consensus_commit_latency_seconds: Optional[float] = None
+    narwhal_primary_network_peers: Optional[int] = None
+    consensus_proposals_in_queue: Optional[int] = None
+    consensus_rejected_transactions_total: Optional[int] = None
     mempool_transactions: Optional[int] = None
+    mempool_transactions_total: Optional[int] = None
+    mempool_pending_transactions: Optional[int] = None
+    
+    # High-impact Prometheus metrics (from TDD requirements)
+    uptime_seconds_total: Optional[int] = None
+    build_info_version: Optional[str] = None
+    build_info_git_commit: Optional[str] = None
+    
+    # Uptime classification and edge-aware policy
+    uptime_status: Optional[str] = None  # "available", "unavailable_public_metrics", "gated", "closed"
+    uptime_expected: Optional[bool] = None  # False for edge nodes
+    edge: Optional[bool] = None  # True for provider edge nodes
+    uptime_evidence: Optional[str] = None  # Evidence string ≤128 chars
     
     # Enhanced network intelligence
     network_peers: Optional[int] = None 
@@ -53,6 +70,7 @@ class SuiDataResult:
     sync_status: Optional[str] = None
     checkpoint_lag: Optional[int] = None
     transaction_throughput: Optional[float] = None
+    transaction_throughput_tps: Optional[float] = None
     reference_gas_price: Optional[int] = None
     total_transactions: Optional[int] = None
     
@@ -64,6 +82,9 @@ class SuiDataResult:
     graphql_available: bool = False
     grpc_available: bool = False
     grpc_services: List[str] = None
+    grpc_reflection_enabled: Optional[bool] = None
+    grpc_services_list: List[str] = None
+    grpc_health_status: Optional[str] = None
     metrics_exposed: bool = False
     
     # Security & configuration
@@ -90,6 +111,9 @@ class SuiDataResult:
     data_completeness: float = 0.0
     intelligence_sources: List[str] = None
     extraction_errors: List[str] = None
+    
+    # Network throughput metrics (TPS & CPS)
+    network_throughput: Optional[Dict[str, Optional[float]]] = None
 
     def __post_init__(self):
         if self.peer_info is None:
@@ -98,6 +122,8 @@ class SuiDataResult:
             self.rpc_methods_available = []
         if self.grpc_services is None:
             self.grpc_services = []
+        if self.grpc_services_list is None:
+            self.grpc_services_list = []
         if self.response_times is None:
             self.response_times = {}
         if self.service_response_times is None:
@@ -118,3 +144,5 @@ class SuiDataResult:
             self.intelligence_sources = []
         if self.extraction_errors is None:
             self.extraction_errors = []
+        if self.network_throughput is None:
+            self.network_throughput = {}
