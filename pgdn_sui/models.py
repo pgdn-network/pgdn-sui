@@ -84,8 +84,10 @@ class SuiDataResult:
     # Service availability intelligence
     rpc_exposed: bool = False
     rpc_authenticated: bool = False
-    rpc_status: Optional[str] = None  # "reachable", "unreachable" (extend.md requirement)
+    rpc_reachable: bool = False  # Rule 1: HTTP 200 JSON-RPC response OR HTTP 429/rate limit after TLS
+    rpc_status: Optional[str] = None  # "reachable", "unreachable", "rate_limited" (extend.md requirement)
     rpc_methods_available: List[str] = None
+    rpc_rate_limit_events: int = 0  # Rule C: Count of rate limit events in this run
     websocket_available: bool = False
     graphql_available: bool = False
     grpc_available: bool = False
@@ -130,6 +132,21 @@ class SuiDataResult:
     node_role: Optional[str] = None  # validator, public_rpc, metrics, hybrid, unknown
     has_narwhal_metrics: bool = False
     narwhal_missing_reason: Optional[str] = None  # not_validator_like, metrics_closed, metrics_gated, missing_metrics_data
+    
+    # Evidence strings (≤128 chars) for specific conditions
+    metrics_evidence: Optional[str] = None  # "metrics closed (timeout)", "rate_limited (429)"
+    rpc_evidence: Optional[str] = None  # "reachable", "rate_limited (429)"
+    grpc_evidence: Optional[str] = None  # "grpc ok (reflection)", "grpc blocked"
+    throughput_evidence: Optional[str] = None  # "delta ok: cps=4.12/37930.4s"
+    
+    # Debug mode sample storage (full samples when debug enabled)
+    debug_samples: Optional[Dict[str, str]] = None  # Full samples for debug mode
+    max_sample_length: int = 200  # Default truncation length
+    
+    # Throughput performance bands relative to network batch
+    tps_band: Optional[str] = None  # "low", "normal", "high" relative to batch p10/p50/p95
+    cps_band: Optional[str] = None  # "low", "normal", "high" relative to batch p10/p50/p95
+    batch_stats: Optional[Dict[str, Any]] = None  # Batch percentile context for debugging
 
     def __post_init__(self):
         if self.peer_info is None:
@@ -166,3 +183,35 @@ class SuiDataResult:
             self.metrics_surface = {}
         if self.open_ports is None:
             self.open_ports = {}
+        if self.debug_samples is None:
+            self.debug_samples = {}
+    
+    def store_sample(self, key: str, sample_data: str, debug_mode: bool = False) -> str:
+        """Store sample data with appropriate truncation based on debug mode"""
+        if debug_mode:
+            # Store full sample in debug mode
+            if self.debug_samples is None:
+                self.debug_samples = {}
+            self.debug_samples[key] = sample_data
+            return sample_data
+        else:
+            # Truncate for normal mode
+            if len(sample_data) <= self.max_sample_length:
+                return sample_data
+            return sample_data[:self.max_sample_length] + " [truncated]"
+    
+    def set_evidence(self, evidence_type: str, evidence: str) -> None:
+        """Set evidence string with length validation (≤128 chars)"""
+        if len(evidence) > 128:
+            evidence = evidence[:125] + "..."
+        
+        if evidence_type == "metrics":
+            self.metrics_evidence = evidence
+        elif evidence_type == "rpc":
+            self.rpc_evidence = evidence
+        elif evidence_type == "grpc":
+            self.grpc_evidence = evidence
+        elif evidence_type == "throughput":
+            self.throughput_evidence = evidence
+        elif evidence_type == "uptime":
+            self.uptime_evidence = evidence

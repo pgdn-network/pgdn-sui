@@ -15,6 +15,52 @@ from .advanced import SuiDataExtractor, SuiDataResult
 from .exceptions import PgdnSuiException, ScannerError, NetworkError, ValidationError
 
 
+def display_batch_statistics(results):
+    """Display throughput batch statistics to stderr"""
+    if not results:
+        return
+    
+    # Find a result with batch_stats to display
+    batch_stats = None
+    for result in results:
+        if hasattr(result, 'batch_stats') and result.batch_stats:
+            batch_stats = result.batch_stats
+            break
+    
+    if not batch_stats:
+        click.echo("No batch statistics available", err=True)
+        return
+    
+    click.echo("\n--- Throughput Batch Statistics ---", err=True)
+    click.echo(f"Batch size: {batch_stats.get('batch_size', 0)} nodes", err=True)
+    click.echo(f"Valid nodes: {batch_stats.get('valid_nodes', 0)} with throughput data", err=True)
+    
+    tps_stats = batch_stats.get('tps')
+    if tps_stats:
+        click.echo(f"TPS: p10={tps_stats['p10']:.2f}, p50={tps_stats['p50']:.2f}, p90={tps_stats['p90']:.2f}, p95={tps_stats['p95']:.2f} (n={tps_stats['count']})", err=True)
+    
+    cps_stats = batch_stats.get('cps')
+    if cps_stats:
+        click.echo(f"CPS: p10={cps_stats['p10']:.2f}, p50={cps_stats['p50']:.2f}, p90={cps_stats['p90']:.2f}, p95={cps_stats['p95']:.2f} (n={cps_stats['count']})", err=True)
+    
+    # Show band distribution
+    tps_bands = {"low": 0, "normal": 0, "high": 0, "none": 0}
+    cps_bands = {"low": 0, "normal": 0, "high": 0, "none": 0}
+    
+    for result in results:
+        if hasattr(result, 'tps_band'):
+            tps_bands[result.tps_band or "none"] += 1
+        if hasattr(result, 'cps_band'):
+            cps_bands[result.cps_band or "none"] += 1
+    
+    if any(count > 0 for count in tps_bands.values() if count):
+        click.echo(f"TPS bands: low={tps_bands['low']}, normal={tps_bands['normal']}, high={tps_bands['high']}", err=True)
+    if any(count > 0 for count in cps_bands.values() if count):
+        click.echo(f"CPS bands: low={cps_bands['low']}, normal={cps_bands['normal']}, high={cps_bands['high']}", err=True)
+    
+    click.echo("", err=True)
+
+
 def format_json(data, pretty=False):
     """Helper function to format JSON consistently"""
     if pretty:
@@ -35,10 +81,12 @@ def format_json(data, pretty=False):
 @click.option('--format', type=click.Choice(['json', 'summary']), default='json',
               help='Output format (default: json)')
 @click.option('--enhanced', is_flag=True, help='Include enhanced data (activeValidators, committee info) in advanced mode')
+@click.option('--max-sample-length', type=int, default=200, help='Maximum sample length for truncation (default: 200, debug mode avoids truncation)')
+@click.option('--show-batch-stats', is_flag=True, help='Display throughput percentile statistics for the batch')
 @click.option('--pretty', is_flag=True, help='Pretty-print JSON output (default: compact)')
 @click.option('--debug', is_flag=True, help='Enable debug logging')
 @click.option('--quiet', is_flag=True, help='Suppress output except results')
-def cli(mode, hostnames, input_file, input_json, timeout, workers, output, format, enhanced, pretty, debug, quiet):
+def cli(mode, hostnames, input_file, input_json, timeout, workers, output, format, enhanced, max_sample_length, show_batch_stats, pretty, debug, quiet):
     """PGDN-SUI: Enhanced Sui network scanner with discovery, deep analysis, and advanced data extraction modes"""
     
     # Set up logging
@@ -158,7 +206,13 @@ def cli(mode, hostnames, input_file, input_json, timeout, workers, output, forma
                     nodes_data.append(node_dict)
                 
                 # Create extractor with the data
-                extractor_config = {'timeout': timeout, 'enhanced': enhanced}
+                extractor_config = {
+                    'timeout': timeout, 
+                    'enhanced': enhanced,
+                    'debug': debug,
+                    'max_sample_length': max_sample_length,
+                    'show_batch_stats': show_batch_stats
+                }
                 extractor = SuiDataExtractor(extractor_config)
                 extractor.discovery_data = nodes_data
                 
@@ -170,7 +224,13 @@ def cli(mode, hostnames, input_file, input_json, timeout, workers, output, forma
                 if hostnames:
                     click.echo("Warning: --hostnames ignored when using --input-file or --input-json", err=True)
                 
-                extractor_config = {'timeout': timeout, 'enhanced': enhanced}
+                extractor_config = {
+                    'timeout': timeout, 
+                    'enhanced': enhanced,
+                    'debug': debug,
+                    'max_sample_length': max_sample_length,
+                    'show_batch_stats': show_batch_stats
+                }
                 
                 if input_file:
                     if not quiet:
@@ -199,6 +259,10 @@ def cli(mode, hostnames, input_file, input_json, timeout, workers, output, forma
             
             # Output results
             if advanced_results:
+                # Display batch statistics if requested
+                if show_batch_stats and advanced_results:
+                    display_batch_statistics(advanced_results)
+                
                 output_data = extractor.export_data(advanced_results, pretty=pretty)
                 
                 if output:

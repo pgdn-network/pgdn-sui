@@ -18,6 +18,7 @@ from .protobuf_manager import SuiProtobufManager
 from .utils import get_primary_port, calculate_gini_coefficient
 from .response_format import standard_response, format_json
 from .throughput_calculator import ThroughputCalculator
+from .throughput_bands import get_band_summary_for_evidence
 from .extractors import (
     RpcExtractor, 
     GrpcExtractor, 
@@ -246,7 +247,37 @@ class SuiDataExtractor:
         except Exception as e:
             self.logger.error(f"Batch metrics calculation failed: {e}")
         
+        # Update evidence strings with band information after batch processing
+        try:
+            self._update_throughput_evidence_with_bands(results)
+            self.logger.debug("Throughput evidence updated with band information")
+        except Exception as e:
+            self.logger.error(f"Failed to update evidence with bands: {e}")
+        
         return results
+
+    def _update_throughput_evidence_with_bands(self, results: List[SuiDataResult]) -> None:
+        """Update throughput evidence strings to include band information after batch processing"""
+        for result in results:
+            if (result.network_throughput and hasattr(result, 'set_evidence')):
+                tps = result.network_throughput.get('tps')
+                cps = result.network_throughput.get('cps')
+                window = result.network_throughput.get('calculation_window_seconds')
+                
+                # Get band information 
+                tps_band = getattr(result, 'tps_band', None)
+                cps_band = getattr(result, 'cps_band', None)
+                
+                # Update evidence string with band information
+                if tps is not None or cps is not None:
+                    band_summary = get_band_summary_for_evidence(tps, cps, tps_band, cps_band)
+                    
+                    if window:
+                        result.set_evidence("throughput", f"delta ok: {band_summary}/{window:.2f}s")
+                    else:
+                        result.set_evidence("throughput", f"delta ok: {band_summary}")
+                        
+                    self.logger.debug(f"Updated throughput evidence for {result.ip}: {band_summary}")
 
     async def _extract_node_intelligence_async(self, node_data: Dict) -> SuiDataResult:
         """Extract comprehensive intelligence from a single Sui node"""
@@ -314,23 +345,46 @@ class SuiDataExtractor:
         return result
 
     def _classify_node_role(self, result: SuiDataResult):
-        """Capability-driven node role classification as specified in requirements"""
+        """
+        Rule 3: Exact node role classification with the specified names
         
-        # Detect gRPC presence (TCP connect successful or full gRPC available)
+        Derive booleans:
+        grpc_detected := TCP connect success to 50051 or 8080 (or grpc health OK)
+        has_narwhal_metrics := metrics_exposed == true AND metrics text contains prefixes {"narwhal_","consensus_"}
+        
+        Classification:
+        1) If has_narwhal_metrics → "validator"
+        2) Else if rpc_reachable and grpc_detected → "rpc_node_with_grpc"
+        3) Else if rpc_reachable → "rpc_node"
+        4) Else if metrics_exposed → "metrics"
+        5) Else → "unknown"
+        """
+        
+        # Rule 3: Detect gRPC presence via TCP connect to 50051 or 8080 (or grpc health OK)
         grpc_detected = (
             result.grpc_available or 
             (hasattr(result, 'open_ports') and result.open_ports and 
              result.open_ports.get('grpc', []))
         )
         
-        # Classification logic based on pure capabilities as specified
-        if result.has_narwhal_metrics or grpc_detected:
+        # Rule 3: Use rpc_reachable from Rule 1 (HTTP 200 or 429/rate limit)
+        rpc_reachable = result.rpc_reachable
+        
+        # Rule 3: has_narwhal_metrics requires both metrics_exposed AND narwhal/consensus prefixes
+        has_narwhal_metrics = result.metrics_exposed and result.has_narwhal_metrics
+        
+        # Rule 3: Classification logic with exact names
+        if has_narwhal_metrics:
             result.node_role = "validator"
-            self.logger.info(f"Node classified as VALIDATOR: Narwhal metrics={result.has_narwhal_metrics}, gRPC={grpc_detected}")
+            self.logger.info(f"Node classified as VALIDATOR: Narwhal metrics detected")
                 
-        elif result.rpc_status == "reachable":
-            result.node_role = "public_rpc"
-            self.logger.info(f"Node classified as PUBLIC_RPC: RPC reachable, no validator indicators")
+        elif rpc_reachable and grpc_detected:
+            result.node_role = "rpc_node_with_grpc"
+            self.logger.info(f"Node classified as RPC_NODE_WITH_GRPC: RPC reachable + gRPC detected")
+            
+        elif rpc_reachable:
+            result.node_role = "rpc_node"
+            self.logger.info(f"Node classified as RPC_NODE: RPC reachable only")
             
         elif result.metrics_exposed:
             result.node_role = "metrics"
@@ -339,57 +393,53 @@ class SuiDataExtractor:
         else:
             result.node_role = "unknown"
             self.logger.info(f"Node classified as UNKNOWN: No clear capabilities detected")
-            
-        # Additionally, check for hybrid classification
-        if result.rpc_status == "reachable" and result.has_narwhal_metrics:
-            result.node_role = "hybrid"
-            self.logger.info(f"Node reclassified as HYBRID: RPC reachable + Narwhal metrics")
+        
+        # Apply uptime expectation rules for RPC nodes with closed metrics
+        if result.node_role in ["rpc_node", "rpc_node_with_grpc"] and not result.metrics_exposed:
+            result.uptime_expected = False
+            self.logger.info(f"Setting uptime_expected=false for {result.node_role} with closed metrics")
         
         # Set narwhal_missing_reason based on role and capabilities
         self._set_narwhal_missing_reason(result, grpc_detected)
         
-        # Store classification evidence
+        # Rule 4: Store classification evidence block (consistent format)
         result.metrics_snapshot["classification"] = {
-            "node_role": result.node_role,
             "evidence": {
-                "rpc_reachable": result.rpc_status == "reachable",
-                "has_narwhal_metrics": result.has_narwhal_metrics,
+                "rpc_reachable": rpc_reachable,
                 "grpc_detected": grpc_detected,
+                "has_narwhal_metrics": has_narwhal_metrics,
                 "metrics_exposed": result.metrics_exposed
-            },
-            "narwhal_missing_reason": result.narwhal_missing_reason
+            }
         }
 
     def _set_narwhal_missing_reason(self, result: SuiDataResult, grpc_detected: bool):
-        """Set narwhal_missing_reason based on capability detection rules"""
+        """
+        Rule E: Set narwhal_missing_reason based on capability detection
+        - has_narwhal_metrics drives validator expectation; grpc presence alone does NOT imply validator
+        - Only set reason for validator_candidate nodes that are missing narwhal data
+        """
         
         # Only set reason if narwhal metrics are missing
         if result.has_narwhal_metrics:
             result.narwhal_missing_reason = None  # No reason needed
             return
-            
-        # Check if this is a validator-like node (has gRPC OR narwhal indicators)
-        is_validator_like = grpc_detected or result.has_narwhal_metrics
         
-        if not is_validator_like:
-            result.narwhal_missing_reason = "not_validator_like"
+        # Rule E: Only check narwhal expectations for validator nodes
+        if result.node_role == "validator":
+            # This shouldn't happen since validator requires has_narwhal_metrics=true
+            result.narwhal_missing_reason = "missing_metrics_data"
             return
-            
-        # Validator-like node but missing narwhal - check metrics accessibility
-        if result.metrics_exposed:
-            # Metrics are exposed but no narwhal data found
+        
+        # For other node roles, check if they have validator-like characteristics but missing narwhal
+        if result.node_role in ["rpc_node", "rpc_node_with_grpc"] and not result.metrics_exposed:
+            # RPC nodes with no metrics - can't determine narwhal presence
+            result.narwhal_missing_reason = "metrics_closed"
+        elif result.node_role in ["rpc_node", "rpc_node_with_grpc"] and result.metrics_exposed:
+            # RPC nodes with metrics but no narwhal data
             result.narwhal_missing_reason = "missing_metrics_data"
         else:
-            # Check if metrics are gated vs closed
-            metrics_gated = any(
-                result.metrics_surface.get(str(port), {}).get("http_status") in ["401", "403"]
-                for port in [9184, 9100, 8080]
-            )
-            
-            if metrics_gated:
-                result.narwhal_missing_reason = "metrics_gated"
-            else:
-                result.narwhal_missing_reason = "metrics_closed"
+            # For metrics_only or unknown nodes, leave null
+            result.narwhal_missing_reason = None
 
     async def _post_process_intelligence(self, result: SuiDataResult):
         """Enhanced post-processing with node health assessment"""
@@ -620,9 +670,15 @@ class SuiDataExtractor:
             result.min_response_time = min(response_times)
 
     async def _calculate_network_throughput(self, result: SuiDataResult):
-        """Calculate TPS and CPS using ThroughputCalculator"""
+        """
+        Rule F: Calculate TPS and CPS with enhanced rate limit and guardrail support
+        - Role-independent calculation
+        - Stable delta_key with lowercased hostname/IP
+        - Δt >= 1.0s guardrail
+        - Independent reasons for TPS vs CPS
+        """
         try:
-            # If RPC is unreachable, set TPS/CPS to null as specified
+            # Rule F: Handle unreachable RPC
             if result.rpc_status == "unreachable":
                 result.network_throughput = {
                     "tps": None,
@@ -633,6 +689,19 @@ class SuiDataExtractor:
                 self.logger.info(f"Setting TPS/CPS to null for {result.ip}: RPC unreachable")
                 return
             
+            # Rule F: Handle rate-limited RPC - compute what we can
+            if result.rpc_status == "rate_limited":
+                # If we have some data despite rate limiting, try to compute
+                if result.total_transactions is None and result.checkpoint_height is None:
+                    result.network_throughput = {
+                        "tps": None,
+                        "cps": None,
+                        "calculation_window_seconds": None,
+                        "reason": "rate_limited"
+                    }
+                    self.logger.info(f"Setting TPS/CPS to null for {result.ip}: Rate limited, no data")
+                    return
+            
             # Extract required data from result
             network = result.network if result.network != "unknown" else "mainnet"  # Default fallback
             ip = result.ip
@@ -641,7 +710,7 @@ class SuiDataExtractor:
             checkpoint_height = result.checkpoint_height
             timestamp = result.timestamp
             
-            # Calculate throughput using ThroughputCalculator (role-independent)
+            # Rule F: Calculate throughput using ThroughputCalculator with stable delta_key
             hostname = getattr(result, 'hostname', None)
             throughput_data = self.throughput_calculator.calculate_throughput(
                 network=network,
@@ -653,14 +722,44 @@ class SuiDataExtractor:
                 hostname=hostname
             )
             
+            # Rule F: Handle rate limiting in throughput data
+            if result.rpc_status == "rate_limited":
+                # If one counter is missing due to rate limit, set appropriate reason
+                if total_transactions is None and checkpoint_height is not None:
+                    throughput_data["tps"] = None
+                    if "reason" not in throughput_data or throughput_data["reason"] is None:
+                        throughput_data["reason"] = "rate_limited"
+                elif checkpoint_height is None and total_transactions is not None:
+                    throughput_data["cps"] = None
+                    if "reason" not in throughput_data or throughput_data["reason"] is None:
+                        throughput_data["reason"] = "rate_limited"
+            
             # Store in result
             result.network_throughput = throughput_data
             
-            # Log successful calculation (but not null values)
+            # Log successful calculation (but not null values) and set evidence strings
             if throughput_data.get("tps") is not None or throughput_data.get("cps") is not None:
-                self.logger.info(f"Throughput calculated for {ip}: TPS={throughput_data.get('tps')}, CPS={throughput_data.get('cps')}")
+                tps = throughput_data.get('tps')
+                cps = throughput_data.get('cps')
+                window = throughput_data.get('calculation_window_seconds')
+                
+                # Create evidence string for successful calculation
+                if tps is not None and cps is not None:
+                    if hasattr(result, 'set_evidence'):
+                        result.set_evidence("throughput", f"delta ok: tps={tps}/cps={cps}/{window:.2f}s")
+                elif cps is not None:
+                    if hasattr(result, 'set_evidence'):
+                        result.set_evidence("throughput", f"delta ok: cps={cps}/{window:.2f}s")
+                elif tps is not None:
+                    if hasattr(result, 'set_evidence'):
+                        result.set_evidence("throughput", f"delta ok: tps={tps}/{window:.2f}s")
+                
+                self.logger.info(f"Throughput calculated for {ip}: TPS={tps}, CPS={cps}, window={window}s")
             else:
-                self.logger.debug(f"Throughput calculation returned null values for {ip} (first observation or guardrails triggered)")
+                reason = throughput_data.get('reason', 'no_data')
+                if hasattr(result, 'set_evidence'):
+                    result.set_evidence("throughput", f"delta failed ({reason})")
+                self.logger.debug(f"Throughput calculation returned null values for {ip}: {reason}")
                 
         except Exception as e:
             self.logger.error(f"Failed to calculate network throughput for {result.ip}: {e}")
@@ -668,7 +767,8 @@ class SuiDataExtractor:
             result.network_throughput = {
                 "tps": None,
                 "cps": None, 
-                "calculation_window_seconds": None
+                "calculation_window_seconds": None,
+                "reason": "calculation_error"
             }
 
     async def _apply_extended_scoring(self, result: SuiDataResult, current_score: float, health_issues: List[str]) -> float:
@@ -692,14 +792,24 @@ class SuiDataExtractor:
             # Don't apply uptime penalties to public nodes
             result.metrics_snapshot["extended_scoring_note"] = "public_node_uptime_neutral"
             
+        elif result.uptime_expected is False:
+            # RPC nodes with closed metrics: don't penalize for uptime issues
+            result.metrics_snapshot["extended_scoring_neutral"] = "rpc_node_closed_metrics_no_uptime_penalty"
+            self.logger.info(f"RPC node neutral scoring: uptime_expected=false, no uptime penalties applied")
+            
         else:
             # Validator/private nodes: apply strict scoring
             
             # Mark down nodes that have no reachable RPC (cannot participate in network queries)
-            if result.rpc_status == "unreachable":
+            if not result.rpc_reachable:
                 health_issues.append("rpc_unreachable_marked_down")
                 extended_score -= 0.3
                 self.logger.warning(f"Validator marked down: No reachable RPC endpoints")
+            
+            # Rule 7: If rpc_status="rate_limited" but rpc_reachable=true → no penalty
+            if result.rpc_status == "rate_limited" and result.rpc_reachable:
+                result.metrics_snapshot["extended_scoring_neutral"] = "rate_limited_but_reachable"
+                self.logger.info(f"Validator neutral scoring: Rate limited but still reachable")
             
             # Check for nodes that hide all uptime metrics while exposing other metrics publicly
             # This indicates partial hardening, not full security
@@ -714,26 +824,34 @@ class SuiDataExtractor:
                     self.logger.warning(f"Validator marked down: Hiding uptime metrics while exposing other metrics (partial hardening)")
             
             # Neutral scoring for nodes that gate metrics entirely (403/401) but have healthy RPC
-            if (result.rpc_status == "reachable" and 
+            if (result.rpc_reachable and 
                 not result.metrics_exposed and 
                 any(result.metrics_snapshot.get(f"port_{port}_gated", False) for port in [9184, 9100])):
                 # This is neutral - don't penalize or boost
                 result.metrics_snapshot["extended_scoring_neutral"] = "gated_metrics_healthy_rpc"
                 self.logger.info(f"Validator neutral scoring: Gated metrics but healthy RPC")
             
-            # Mark up nodes that have both RPC and uptime metrics available and correct
-            if (result.rpc_status == "reachable" and 
+            # Rule 7: Mark up nodes that have both RPC and uptime metrics available and correct
+            if (result.rpc_reachable and 
                 result.uptime_status == "available" and 
                 result.uptime_seconds_total is not None):
                 health_issues.append("rpc_and_uptime_available_marked_up")
                 extended_score += 0.1  # Boost score for fully accessible nodes
                 self.logger.info(f"Validator marked up: Both RPC and uptime metrics are exposed and correct")
+            
+            # Rule 7: Boost score for validators with exposed metrics
+            if result.node_role == "validator" and result.metrics_exposed:
+                extended_score += 0.1
+                health_issues.append("validator_with_metrics_marked_up")
+                self.logger.info(f"Validator marked up: Validator role with exposed metrics")
         
         # Store extended scoring metadata
         result.metrics_snapshot["extended_scoring"] = {
             "rpc_status": result.rpc_status,
+            "rpc_reachable": result.rpc_reachable,
             "uptime_status": result.uptime_status,
             "uptime_source": result.uptime_source,
+            "uptime_expected": result.uptime_expected,
             "metrics_exposed": result.metrics_exposed,
             "is_public_node": is_public,
             "score_adjustment": round(extended_score - current_score, 2)

@@ -101,8 +101,39 @@ class SuiClientExtractor:
             return False
 
     async def _test_sui_client_connectivity(self, rpc_url: str) -> bool:
-        """Test if Sui client can connect to the RPC URL"""
+        """Test if Sui client can connect to the RPC URL with improved validation"""
         try:
+            # First try a simple curl test to validate endpoint responsiveness
+            curl_test = subprocess.run([
+                "curl", "-s", "-m", "5", "-X", "POST", 
+                "-H", "Content-Type: application/json",
+                "-d", '{"jsonrpc":"2.0","method":"sui_getChainIdentifier","params":[],"id":1}',
+                rpc_url
+            ], capture_output=True, text=True, timeout=6)
+            
+            if curl_test.returncode == 0:
+                response = curl_test.stdout.strip()
+                
+                # Check if we got HTML error page
+                if response.startswith('<!DOCTYPE html') or response.startswith('<html'):
+                    self.logger.debug(f"CONNECTIVITY: {rpc_url} returned HTML error page - not a valid RPC endpoint")
+                    return False
+                
+                # Check if we got a JSON response (even if error)
+                if response.startswith('{'):
+                    try:
+                        data = json.loads(response)
+                        if "result" in data or "error" in data:
+                            self.logger.debug(f"CONNECTIVITY: {rpc_url} returned valid JSON-RPC response")
+                            return True
+                    except json.JSONDecodeError:
+                        pass
+                
+                # If we got some other response, it's not a valid RPC endpoint
+                self.logger.debug(f"CONNECTIVITY: {rpc_url} returned non-JSON response: {response[:50]}")
+                return False
+            
+            # If curl failed, try the original sui client approach as fallback
             cmd = [
                 self.sui_binary, "client", 
                 "--client.rpc-url", rpc_url,
@@ -124,8 +155,10 @@ class SuiClientExtractor:
                 return False
                 
         except subprocess.TimeoutExpired:
+            self.logger.debug(f"CONNECTIVITY: Timeout testing {rpc_url}")
             return False
-        except Exception:
+        except Exception as e:
+            self.logger.debug(f"CONNECTIVITY: Error testing {rpc_url}: {e}")
             return False
 
     async def _extract_comprehensive_sui_client_data(self, result: SuiDataResult, rpc_url: str) -> bool:
@@ -192,13 +225,24 @@ class SuiClientExtractor:
                     intelligence_extracted = True
                     self.logger.info(f"SUCCESS: Extracted {command_info['extract']} via command")
                 else:
-                    # Log the failure
-                    if command_info["critical"]:
-                        critical_failures += 1
-                        result.extraction_errors.append(f"sui_client_critical_failure_{command_info['extract']}: {cmd_result.stderr[:100]}")
-                        self.logger.warning(f"CRITICAL FAILURE: Command failed: {command_info['extract']}")
+                    # Check if this is an HTML error response
+                    stderr_output = cmd_result.stderr.strip()
+                    if stderr_output.startswith('<!DOCTYPE html') or stderr_output.startswith('<html'):
+                        error_msg = "HTML error page received instead of JSON response"
+                        if command_info["critical"]:
+                            critical_failures += 1
+                            result.extraction_errors.append(f"sui_client_html_error_{command_info['extract']}: {error_msg}")
+                            self.logger.warning(f"HTML ERROR: {command_info['extract']} returned HTML error page")
                     else:
-                        self.logger.debug(f"COMMAND ERROR: {command_info['extract']} - {cmd_result.stderr[:50]}")
+                        # Log the failure
+                        if command_info["critical"]:
+                            critical_failures += 1
+                            # Only store the first 50 chars of stderr to avoid noise
+                            error_summary = stderr_output[:50] + "..." if len(stderr_output) > 50 else stderr_output
+                            result.extraction_errors.append(f"sui_client_critical_failure_{command_info['extract']}: {error_summary}")
+                            self.logger.warning(f"CRITICAL FAILURE: Command failed: {command_info['extract']} - {error_summary}")
+                        else:
+                            self.logger.debug(f"COMMAND ERROR: {command_info['extract']} - {stderr_output[:50]}")
                         
             except subprocess.TimeoutExpired:
                 if command_info["critical"]:
@@ -224,6 +268,20 @@ class SuiClientExtractor:
         try:
             output = output.strip()
             
+            # Detect HTML error pages early
+            if output.startswith('<!DOCTYPE html') or output.startswith('<html'):
+                error_msg = f"HTML error page received instead of JSON response"
+                result.extraction_errors.append(f"sui_client_html_error_{extract_type}: {error_msg}")
+                self.logger.warning(f"HTML ERROR: {extract_type} returned HTML error page from {rpc_url}")
+                return
+            
+            # Validate that we have actual content
+            if not output or len(output) < 3:
+                error_msg = f"Empty or minimal response received"
+                result.extraction_errors.append(f"sui_client_empty_response_{extract_type}: {error_msg}")
+                self.logger.warning(f"EMPTY RESPONSE: {extract_type} returned empty response from {rpc_url}")
+                return
+            
             if extract_type in ["chain_id_curl", "chain_id"]:
                 # Extract chain identifier from JSON response or direct output
                 if output.startswith('{'):
@@ -231,8 +289,17 @@ class SuiClientExtractor:
                         data = json.loads(output)
                         if "result" in data:
                             result.chain_identifier = str(data["result"]).strip('"')
-                    except json.JSONDecodeError:
-                        pass
+                        elif "error" in data:
+                            error_info = data["error"]
+                            error_msg = f"RPC error: {error_info.get('message', 'unknown error')}"
+                            result.extraction_errors.append(f"sui_client_rpc_error_{extract_type}: {error_msg}")
+                            self.logger.warning(f"RPC ERROR: {extract_type} returned RPC error: {error_info}")
+                            return
+                    except json.JSONDecodeError as e:
+                        error_msg = f"Invalid JSON response: {str(e)}"
+                        result.extraction_errors.append(f"sui_client_json_error_{extract_type}: {error_msg}")
+                        self.logger.warning(f"JSON ERROR: {extract_type} failed to parse JSON from {rpc_url}: {str(e)}")
+                        return
                 elif output and len(output) > 2:
                     result.chain_identifier = output.strip('"')
                 
@@ -254,14 +321,32 @@ class SuiClientExtractor:
                         data = json.loads(output)
                         if "result" in data:
                             result.checkpoint_height = int(data["result"])
-                    except (json.JSONDecodeError, ValueError, TypeError):
-                        pass
+                            self.logger.info(f"BLOCKCHAIN DATA: Checkpoint height: {result.checkpoint_height}")
+                        elif "error" in data:
+                            error_info = data["error"]
+                            error_msg = f"RPC error: {error_info.get('message', 'unknown error')}"
+                            result.extraction_errors.append(f"sui_client_rpc_error_{extract_type}: {error_msg}")
+                            self.logger.warning(f"RPC ERROR: {extract_type} returned RPC error: {error_info}")
+                            return
+                    except json.JSONDecodeError as e:
+                        error_msg = f"Invalid JSON response: {str(e)}"
+                        result.extraction_errors.append(f"sui_client_json_error_{extract_type}: {error_msg}")
+                        self.logger.warning(f"JSON ERROR: {extract_type} failed to parse JSON from {rpc_url}: {str(e)}")
+                        return
+                    except (ValueError, TypeError) as e:
+                        error_msg = f"Invalid checkpoint number in response: {str(e)}"
+                        result.extraction_errors.append(f"sui_client_parse_error_{extract_type}: {error_msg}")
+                        self.logger.warning(f"PARSE ERROR: {extract_type} invalid checkpoint number: {str(e)}")
+                        return
                 else:
                     try:
                         result.checkpoint_height = int(output.strip('"'))
                         self.logger.info(f"BLOCKCHAIN DATA: Checkpoint height: {result.checkpoint_height}")
-                    except (ValueError, TypeError):
-                        pass
+                    except (ValueError, TypeError) as e:
+                        error_msg = f"Invalid checkpoint format in raw response: {str(e)}"
+                        result.extraction_errors.append(f"sui_client_parse_error_{extract_type}: {error_msg}")
+                        self.logger.warning(f"PARSE ERROR: {extract_type} invalid raw checkpoint: {str(e)}")
+                        return
             
             elif extract_type in ["system_state_curl", "epoch_state"]:
                 # Parse system state JSON
@@ -297,10 +382,29 @@ class SuiClientExtractor:
                                     result.validator_count = len(active_validators)
                                 
                             self.logger.info(f"BLOCKCHAIN STATE: Epoch {result.current_epoch}, {result.validator_count} validators")
+                        
+                        elif "error" in data:
+                            error_info = data["error"]
+                            error_msg = f"RPC error: {error_info.get('message', 'unknown error')}"
+                            result.extraction_errors.append(f"sui_client_rpc_error_{extract_type}: {error_msg}")
+                            self.logger.warning(f"RPC ERROR: {extract_type} returned RPC error: {error_info}")
+                            return
+                        else:
+                            error_msg = f"Unexpected JSON response structure"
+                            result.extraction_errors.append(f"sui_client_structure_error_{extract_type}: {error_msg}")
+                            self.logger.warning(f"STRUCTURE ERROR: {extract_type} unexpected response structure from {rpc_url}")
+                            return
                             
-                    except json.JSONDecodeError:
-                        # If not JSON, treat as raw output
-                        result.system_state["raw_output"] = output[:500]
+                    except json.JSONDecodeError as e:
+                        error_msg = f"Invalid JSON response: {str(e)}"
+                        result.extraction_errors.append(f"sui_client_json_error_{extract_type}: {error_msg}")
+                        self.logger.warning(f"JSON ERROR: {extract_type} failed to parse JSON from {rpc_url}: {str(e)}")
+                        return
+                else:
+                    error_msg = f"Non-JSON response received"
+                    result.extraction_errors.append(f"sui_client_format_error_{extract_type}: {error_msg}")
+                    self.logger.warning(f"FORMAT ERROR: {extract_type} expected JSON but got: {output[:100]}")
+                    return
                         
             # Store the raw output for debugging
             result.metrics_snapshot[f"sui_client_{extract_type}_raw"] = output[:200] if len(output) > 200 else output

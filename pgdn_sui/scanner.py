@@ -58,6 +58,29 @@ class SuiNodeResult:
     ssl_info: Dict = None          # NEW: SSL/TLS certificate details
     security_scan: Dict = None     # NEW: Security assessment
     analysis_level: str = "discovery"
+    
+    # Evidence strings (≤128 chars) for compatibility with advanced mode
+    metrics_evidence: Optional[str] = None
+    rpc_evidence: Optional[str] = None
+    grpc_evidence: Optional[str] = None
+    throughput_evidence: Optional[str] = None
+    uptime_evidence: Optional[str] = None
+
+    def set_evidence(self, evidence_type: str, evidence: str) -> None:
+        """Set evidence string with length validation (≤128 chars) - compatibility method"""
+        if len(evidence) > 128:
+            evidence = evidence[:125] + "..."
+        
+        if evidence_type == "metrics":
+            self.metrics_evidence = evidence
+        elif evidence_type == "rpc":
+            self.rpc_evidence = evidence
+        elif evidence_type == "grpc":
+            self.grpc_evidence = evidence
+        elif evidence_type == "throughput":
+            self.throughput_evidence = evidence
+        elif evidence_type == "uptime":
+            self.uptime_evidence = evidence
 
 class EnhancedSuiScanner:
     """Enhanced scanner with comprehensive endpoint analysis"""

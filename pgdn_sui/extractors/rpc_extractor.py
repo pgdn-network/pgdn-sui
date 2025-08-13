@@ -1,15 +1,18 @@
 #!/usr/bin/env python3
 """
 RPC Extractor
-Handles JSON-RPC extraction from Sui nodes
+Handles JSON-RPC extraction from Sui nodes with token bucket rate limiting
 """
 
 import json
 import time
+import random
 import logging
 import requests
 from typing import List, Dict, Any, Optional
 from ..models import SuiDataResult
+from ..rate_limiter import get_rate_limiter
+from ..throughput_bands import ThroughputBandCalculator
 
 logger = logging.getLogger(__name__)
 
@@ -44,7 +47,36 @@ class RpcExtractor:
     def __init__(self, timeout: int = 10, config: Dict = None):
         self.timeout = timeout
         self.config = config or {}
+        self.debug_mode = self.config.get('debug', False)
+        self.max_sample_length = self.config.get('max_sample_length', 200)
         self.logger = logger
+        self.backoff_delay = 0.5  # Rule 6: Base 500ms backoff
+        self.max_backoff_delay = 5.0  # Rule 6: Cap at 5s
+        self.rate_limiter = get_rate_limiter()  # Token bucket rate limiter
+        
+        # Essential methods that should always be attempted (even when rate limited)
+        self.essential_methods = {
+            "sui_getChainIdentifier",
+            "suix_getLatestSuiSystemState", 
+            "sui_getLatestCheckpointSequenceNumber",
+            "suix_getCommitteeInfo"
+        }
+        
+        # Non-essential methods that can be skipped when rate limited
+        self.non_essential_methods = {
+            "suix_getValidatorsApy",
+            "sui_getTotalTransactionBlocks", 
+            "suix_getReferenceGasPrice",
+            "sui_getProtocolConfig",
+            "rpc.discover",
+            "suix_getAllBalances",
+            "sui_tryGetPastObject",
+            "suix_getCoinMetadata",
+            "suix_getStakes",
+            "sui_getValidators",
+            "suix_queryObjects",
+            "sui_getCheckpoint"
+        }
     
     def _build_rpc_permutations(self, ip: str) -> List[str]:
         """Build RPC endpoint permutations exactly as specified in user requirements"""
@@ -66,6 +98,79 @@ class RpcExtractor:
                 endpoints.append(endpoint)
         
         return endpoints
+    
+    def _detect_rate_limit(self, response, response_data: dict = None) -> bool:
+        """
+        Rule C: Detect rate limiting via HTTP 429 OR JSON body containing rate limit patterns
+        """
+        # Check HTTP 429 status code
+        if hasattr(response, 'status_code') and response.status_code == 429:
+            return True
+        
+        # Check JSON body for rate limit patterns
+        if response_data and isinstance(response_data, dict):
+            # Check for specific rate limit error message patterns
+            error_msg = response_data.get("error_msg", "")
+            if "Your request is too frequent" in error_msg:
+                return True
+            
+            # Check error object for rate limit indicators
+            if "error" in response_data:
+                error_obj = response_data["error"]
+                if isinstance(error_obj, dict):
+                    error_message = error_obj.get("message", "")
+                    if "too frequent" in error_message.lower() or "rate limit" in error_message.lower():
+                        return True
+        
+        return False
+    
+    def _should_make_request(self, endpoint: str, method: str, is_rate_limited: bool = False) -> bool:
+        """
+        Determine if we should make a request based on rate limiting and method priority
+        
+        Args:
+            endpoint: RPC endpoint URL
+            method: RPC method name
+            is_rate_limited: Whether this host is currently rate limited
+            
+        Returns:
+            True if request should be made, False if skipped
+        """
+        # Always check token bucket first (applies to all requests)
+        if not self.rate_limiter.can_make_request(endpoint):
+            self.logger.info(f"Token bucket rate limit: skipping {method} for {endpoint}")
+            return False
+        
+        # If host is rate limited (429/error responses), only allow essential methods
+        if is_rate_limited:
+            if method in self.essential_methods:
+                self.logger.info(f"Rate limited but essential: allowing {method} for {endpoint}")
+                return True
+            elif method in self.non_essential_methods:
+                self.logger.info(f"Rate limited, skipping non-essential: {method} for {endpoint}")
+                return False
+            else:
+                # Unknown method - treat as non-essential when rate limited
+                self.logger.info(f"Rate limited, skipping unknown method: {method} for {endpoint}")
+                return False
+        
+        # Not rate limited - allow all requests (token bucket already checked)
+        return True
+    
+    def _apply_exponential_backoff(self) -> None:
+        """
+        Rule 6: Apply exponential backoff with jitter (base 500ms, max 5s)
+        On first 429 per host, switch subsequent RPC calls in this run to exponential backoff
+        """
+        # Add jitter (±25% random variation)
+        jitter = random.uniform(0.75, 1.25)
+        actual_delay = min(self.backoff_delay * jitter, self.max_backoff_delay)
+        
+        self.logger.info(f"Rate limit detected, applying backoff: {actual_delay:.3f}s")
+        time.sleep(actual_delay)
+        
+        # Double the backoff for next time (exponential)
+        self.backoff_delay = min(self.backoff_delay * 2, self.max_backoff_delay)
         
     async def extract_rpc_intelligence_async(self, result: SuiDataResult, ip: str, ports: List[int]) -> bool:
         """Extract comprehensive intelligence via JSON-RPC with enhanced debugging and extend.md permutations"""
@@ -73,12 +178,18 @@ class RpcExtractor:
         # Extended RPC endpoint permutations as specified in extend.md
         rpc_endpoints = self._build_rpc_permutations(ip)
         
-        # Set initial RPC status
+        # Set initial RPC status and reachability
         result.rpc_status = "unreachable"
+        result.rpc_reachable = False
         
         for endpoint in rpc_endpoints:
             try:
                 self.logger.info(f"Testing RPC endpoint: {endpoint}")
+                
+                # Check token bucket rate limit before making request
+                if not self._should_make_request(endpoint, "sui_getChainIdentifier", False):
+                    self.logger.info(f"Skipping initial connectivity test for {endpoint} due to rate limiting")
+                    continue
                 
                 # Test basic connectivity and authentication with short timeouts
                 start_time = time.time()
@@ -94,7 +205,17 @@ class RpcExtractor:
                 
                 self.logger.info(f"RPC {endpoint} responded with status {test_response.status_code} in {response_time:.3f}s")
                 
-                if test_response.status_code in [401, 403]:
+                # Rule 1a: Check for HTTP 429 rate limiting first - this counts as reachable
+                if test_response.status_code == 429:
+                    result.rpc_rate_limit_events += 1
+                    result.rpc_status = "rate_limited"
+                    result.rpc_reachable = True  # Rule 1: HTTP 429 = reachable
+                    if hasattr(result, 'set_evidence'):
+                        result.set_evidence("rpc", "rate_limited (429)")
+                    self.logger.warning(f"Rate limit detected (HTTP 429) on RPC endpoint {endpoint}")
+                    self._apply_exponential_backoff()
+                    continue
+                elif test_response.status_code in [401, 403]:
                     result.rpc_authenticated = True
                     self.logger.info(f"SECURED: RPC endpoint {endpoint} requires authentication")
                     continue
@@ -107,11 +228,26 @@ class RpcExtractor:
                         response_data = test_response.json()
                         self.logger.info(f"RPC response: {str(response_data)[:200]}...")
                         
+                        # Rule 1b: Check for rate limiting in JSON body - this counts as reachable
+                        if self._detect_rate_limit(test_response, response_data):
+                            result.rpc_rate_limit_events += 1
+                            result.rpc_status = "rate_limited"
+                            result.rpc_reachable = True  # Rule 1: Rate limit after successful TLS = reachable
+                            if hasattr(result, 'set_evidence'):
+                                result.set_evidence("rpc", "rate_limited (body)")
+                            self.logger.warning(f"Rate limit detected on RPC endpoint {endpoint}")
+                            # Apply backoff for remaining requests in this run
+                            self._apply_exponential_backoff()
+                            continue  # Try next endpoint
+                        
                         if "result" in response_data and response_data["result"]:
                             self.logger.info(f"SUCCESS: RPC endpoint {endpoint} returned valid data: {response_data['result']}")
                             
                             # Set RPC status to reachable
                             result.rpc_status = "reachable"
+                            result.rpc_reachable = True  # Rule 1: HTTP 200 JSON-RPC response = reachable
+                            if hasattr(result, 'set_evidence'):
+                                result.set_evidence("rpc", "reachable")
                             
                             # Process the chain identifier immediately
                             result.chain_identifier = str(response_data["result"])
@@ -138,6 +274,7 @@ class RpcExtractor:
                                 self.logger.info(f"PARTIAL: RPC endpoint {endpoint} is working but method not supported")
                                 # Set RPC status to reachable
                                 result.rpc_status = "reachable"
+                                result.rpc_reachable = True  # Rule 1: HTTP 200 JSON-RPC response = reachable
                                 # Try other methods on this endpoint
                                 await self._extract_comprehensive_rpc_intelligence(result, endpoint)
                                 return True
@@ -168,7 +305,12 @@ class RpcExtractor:
                 self.logger.debug(f"RPC endpoint {endpoint} error: {e}")
                 continue
         
-        self.logger.warning(f"FAILED: No working RPC endpoints found for {ip}")
+        # Rule 1: Only set unreachable if ALL attempts failed with timeout/TLS/DNS errors/connection refused
+        # If we got any HTTP responses (even 404/500), that means TLS worked
+        if not result.rpc_reachable:
+            result.rpc_status = "unreachable"  # All attempts failed with connection-level errors
+        
+        self.logger.warning(f"FAILED: No working RPC endpoints found for {ip}, final status: {result.rpc_status}")
         return False
 
     async def _extract_comprehensive_rpc_intelligence(self, result: SuiDataResult, endpoint: str):
@@ -217,8 +359,16 @@ class RpcExtractor:
         
         self.logger.info(f"RPC EXTRACTION: Starting comprehensive analysis with {total_methods} methods")
         
+        # Track if this host is currently rate limited for method prioritization
+        host_is_rate_limited = (result.rpc_status == "rate_limited")
+        
         for method, params in all_methods:
             try:
+                # Check if we should make this request based on rate limiting and method priority
+                if not self._should_make_request(endpoint, method, host_is_rate_limited):
+                    self.logger.info(f"SKIPPING: RPC method {method} due to rate limiting")
+                    continue
+                
                 self.logger.info(f"TESTING: RPC method {method} with params: {params}")
                 
                 response = requests.post(endpoint, json={
@@ -228,8 +378,30 @@ class RpcExtractor:
                     "id": hash(method) % 1000
                 }, timeout=self.timeout, verify=False)
                 
+                # Rule 1: Check for rate limiting - maintain reachable status
+                if response.status_code == 429:
+                    result.rpc_rate_limit_events += 1
+                    if result.rpc_status != "rate_limited":
+                        result.rpc_status = "rate_limited"
+                        result.rpc_reachable = True  # Rule 1: HTTP 429 = reachable
+                        host_is_rate_limited = True  # Update local flag for method prioritization
+                    self.logger.warning(f"Rate limit hit on method {method}, applying backoff")
+                    self._apply_exponential_backoff()
+                    continue  # Skip this method but continue with others
+                
                 if response.status_code == 200:
                     data = response.json()
+                    
+                    # Rule 1: Check JSON body for rate limit patterns - maintain reachable status
+                    if self._detect_rate_limit(response, data):
+                        result.rpc_rate_limit_events += 1
+                        if result.rpc_status != "rate_limited":
+                            result.rpc_status = "rate_limited"
+                            result.rpc_reachable = True  # Rule 1: Rate limit after successful TLS = reachable
+                            host_is_rate_limited = True  # Update local flag for method prioritization
+                        self.logger.warning(f"Rate limit detected in JSON response for method {method}")
+                        self._apply_exponential_backoff()
+                        continue  # Skip this method but continue with others
                     
                     if "result" in data and data["result"] is not None:
                         await self._process_rpc_method_result(result, method, data["result"])
@@ -415,13 +587,13 @@ class RpcExtractor:
                 }
                 self.logger.info(f"SUI coin metadata: {data.get('symbol')} ({data.get('decimals')} decimals)")
                 
-            # Store raw data for debugging (but limit size)
-            if method in ["suix_getLatestSuiSystemState", "suix_getCommitteeInfo"] and not self.config.get('enhanced', False):
-                # Store a smaller sample for debugging when not in enhanced mode
-                sample_data = str(data)[:500] + "... [truncated]" if len(str(data)) > 500 else str(data)
-                result.metrics_snapshot[f"rpc_{method}_sample"] = sample_data
-            else:
-                result.metrics_snapshot[f"rpc_{method}_sample"] = str(data)[:200] if isinstance(data, (dict, list)) else str(data)
+            # Store raw data using consistent sample handling
+            sample_key = f"rpc_{method}_sample"
+            sample_data = str(data) if isinstance(data, (dict, list)) else str(data)
+            
+            # Use the model's store_sample method for consistent truncation
+            stored_sample = result.store_sample(sample_key, sample_data, self.debug_mode)
+            result.metrics_snapshot[sample_key] = stored_sample
             
         except Exception as e:
             result.extraction_errors.append(f"rpc_processing_error_{method}: {str(e)}")
@@ -496,7 +668,7 @@ class RpcExtractor:
         return False
 
     def calculate_batch_metrics(self, results: List[SuiDataResult]):
-        """Calculate checkpoint lag and transaction throughput across the scan batch"""
+        """Calculate checkpoint lag, transaction throughput, and performance bands across the scan batch"""
         if not results:
             return
             
@@ -515,7 +687,7 @@ class RpcExtractor:
             for result in results:
                 if result.checkpoint_height:
                     result.checkpoint_lag = max_checkpoint - result.checkpoint_height
-                    self.logger.info(f"Node {result.ip} checkpoint lag: {result.checkpoint_lag} blocks")
+                    self.logger.debug(f"Node {result.ip} checkpoint lag: {result.checkpoint_lag} blocks")
         
         # Calculate transaction throughput TPS from delta (if we had previous scan data)
         # For now, store the transaction counts for future delta calculations
@@ -526,5 +698,9 @@ class RpcExtractor:
                     "timestamp": time.time(),
                     "checkpoint": result.checkpoint_height
                 }
-                
-        self.logger.info(f"Batch analysis complete: max checkpoint {max_checkpoint}, {len(checkpoint_nodes)} nodes with checkpoint data")
+        
+        # Calculate throughput performance bands relative to batch
+        band_calculator = ThroughputBandCalculator()
+        band_summary = band_calculator.calculate_batch_bands(results)
+        
+        self.logger.info(f"Batch analysis complete: max checkpoint {max_checkpoint}, {len(checkpoint_nodes)} nodes with checkpoint data, throughput bands calculated")

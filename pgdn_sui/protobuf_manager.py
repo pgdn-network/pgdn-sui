@@ -26,13 +26,26 @@ class SuiProtobufManager:
         
     def _find_sui_repo(self) -> Optional[str]:
         """Find Sui repository in common locations"""
+        # First check environment variable
+        if os.environ.get("SUI_REPO_PATH"):
+            sui_path = Path(os.environ["SUI_REPO_PATH"]).expanduser()
+            if sui_path.exists() and (sui_path / "crates").exists():
+                logger.info(f"Found Sui repository via SUI_REPO_PATH: {sui_path}")
+                return str(sui_path)
+            else:
+                logger.warning(f"SUI_REPO_PATH points to invalid location: {sui_path}")
+        
+        # Common repository locations
         common_paths = [
             "./sui",
             "../sui", 
             "~/sui",
             "~/code/sui",
+            "~/Code/sui", 
+            "~/src/sui",
+            "~/Developer/sui",
             "/opt/sui",
-            os.environ.get("SUI_REPO_PATH", "")
+            "/usr/local/src/sui"
         ]
         
         for path in common_paths:
@@ -41,12 +54,76 @@ class SuiProtobufManager:
                 logger.info(f"Found Sui repository at: {expanded_path}")
                 return str(expanded_path)
         
+        # Check if we can find it via git or other methods
+        sui_from_git = self._find_sui_via_git()
+        if sui_from_git:
+            return sui_from_git
+        
         return None
+    
+    def _find_sui_via_git(self) -> Optional[str]:
+        """Try to find Sui repository using git or other methods"""
+        try:
+            # Look for recently used git repositories that might be Sui
+            import subprocess
+            
+            # Check if we're in a Sui repo
+            try:
+                result = subprocess.run(['git', 'remote', 'get-url', 'origin'], 
+                                      capture_output=True, text=True, timeout=5)
+                if result.returncode == 0 and 'sui' in result.stdout.lower():
+                    # We might be in or near a Sui repo
+                    potential_paths = ['.', '..', '../sui']
+                    for path in potential_paths:
+                        expanded_path = Path(path).expanduser().resolve()
+                        if (expanded_path / "crates").exists():
+                            logger.info(f"Found Sui repository via git detection: {expanded_path}")
+                            return str(expanded_path)
+            except Exception:
+                pass
+                
+        except Exception as e:
+            logger.debug(f"Git-based Sui detection failed: {e}")
+        
+        return None
+    
+    def _check_sui_binary(self) -> Dict[str, any]:
+        """Check if Sui binary is available and get version info"""
+        try:
+            import subprocess
+            result = subprocess.run(['sui', '--version'], 
+                                  capture_output=True, text=True, timeout=10)
+            if result.returncode == 0:
+                version_info = result.stdout.strip()
+                logger.info(f"Sui binary found: {version_info}")
+                return {
+                    "available": True,
+                    "version": version_info,
+                    "binary_path": "sui"  # Could be expanded to find full path
+                }
+        except Exception as e:
+            logger.debug(f"Sui binary check failed: {e}")
+        
+        return {"available": False}
     
     def setup_protobufs(self) -> bool:
         """Setup and compile Sui protobufs for gRPC"""
         if not self.sui_repo_path:
-            logger.warning("Sui repository not found. gRPC functionality will be limited.")
+            # Check if Sui binary is available
+            sui_binary_info = self._check_sui_binary()
+            
+            if sui_binary_info["available"]:
+                logger.info("Sui source repository not found, but Sui binary is available.")
+                logger.info(f"Binary version: {sui_binary_info['version']}")
+                logger.info("Note: gRPC functionality requires Sui source repository with .proto files")
+                logger.info("gRPC enables: validator consensus data, real-time transaction streaming, advanced node introspection")
+            else:
+                logger.info("Neither Sui source repository nor Sui binary found.")
+                
+            logger.info("To enable full gRPC functionality (optional for most use cases):")
+            logger.info("  1. Set SUI_REPO_PATH environment variable to your Sui source directory")
+            logger.info("  2. Or clone Sui repository: git clone https://github.com/MystenLabs/sui.git")
+            logger.debug("Checked locations: ~/sui, ~/Code/sui, ~/code/sui, ~/src/sui, ~/Developer/sui")
             return False
         
         try:

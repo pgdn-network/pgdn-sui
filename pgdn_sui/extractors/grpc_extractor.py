@@ -33,6 +33,8 @@ class GrpcExtractor:
     def __init__(self, timeout: int = 10, config: dict = None, sui_grpc_stubs=None):
         self.timeout = timeout
         self.config = config or {}
+        self.debug_mode = self.config.get('debug', False)
+        self.max_sample_length = self.config.get('max_sample_length', 200)
         self.sui_grpc_stubs = sui_grpc_stubs
         self.logger = logger
 
@@ -59,6 +61,8 @@ class GrpcExtractor:
                 try:
                     grpc.channel_ready_future(channel).result(timeout=2)
                     result.grpc_available = True
+                    if hasattr(result, 'set_evidence'):
+                        result.set_evidence("grpc", f"grpc ok (port {port})")
                     
                     # Enhanced gRPC intelligence extraction for port 9000
                     if port == 9000:
@@ -119,13 +123,18 @@ class GrpcExtractor:
                 continue
         
         if open_grpc_ports:
-            result.grpc_available = True  
+            result.grpc_available = True
+            if hasattr(result, 'set_evidence'):
+                result.set_evidence("grpc", f"grpc ok (tcp {open_grpc_ports})")
             # Store detected open ports for evidence
             if not hasattr(result, 'open_ports'):
                 result.open_ports = {}
             result.open_ports['grpc'] = open_grpc_ports
             self.logger.info(f"gRPC detected via TCP connect on ports: {open_grpc_ports}")
             return True
+        else:
+            if hasattr(result, 'set_evidence'):
+                result.set_evidence("grpc", "grpc blocked")
             
         return False
 

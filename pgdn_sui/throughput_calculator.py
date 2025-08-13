@@ -150,12 +150,12 @@ class ThroughputCalculator:
         key = self._create_key(network, hostname_or_ip, port)
         ts_now = self._convert_timestamp_to_epoch(timestamp)
         
-        # Initialize result
+        # Rule F: Initialize result with independent reasons
         result = {
             "tps": None,
             "cps": None, 
             "calculation_window_seconds": None,
-            "reason": None
+            "reason": None  # Overall reason if both are null for same reason
         }
         
         # Get previous snapshot
@@ -189,7 +189,7 @@ class ThroughputCalculator:
         
         result["calculation_window_seconds"] = round(delta_t, 2)
         
-        # Apply guardrails - require Δt >= 1s as specified
+        # Rule F: Apply guardrails - require Δt >= 1s as specified
         if delta_t < 1.0:
             logger.debug(f"Delta time too small ({delta_t:.2f}s < 1s), setting TPS/CPS to null")
             result["reason"] = "interval_too_short"
@@ -198,13 +198,15 @@ class ThroughputCalculator:
         
         # Track if we have any valid calculations
         has_calculations = False
+        tps_reason = None
+        cps_reason = None
         
-        # Calculate TPS with enhanced guardrails
+        # Rule F: Calculate TPS with independent reason tracking
         if delta_tx is not None and total_transactions is not None and prev_snapshot.get('total_transactions') is not None:
             if delta_tx < 0:
                 logger.warning(f"Transaction counter reset detected for {key} (Δtx={delta_tx})")
                 result["tps"] = None
-                result["reason"] = "counter_reset"
+                tps_reason = "counter_reset"
             elif delta_tx == 0:
                 # No new transactions - legitimate 0 TPS
                 result["tps"] = 0.0
@@ -217,14 +219,15 @@ class ThroughputCalculator:
                 # Quality check for TPS (allow 0, flag unusual high values)
                 if result["tps"] > 50_000:  # Very high TPS threshold
                     logger.warning(f"TPS sanity check: unusually high TPS value {result['tps']} for {key}")
+        elif total_transactions is None:
+            tps_reason = "missing_counters"
         
-        # Calculate CPS with enhanced guardrails
+        # Rule F: Calculate CPS with independent reason tracking
         if delta_cp is not None and checkpoint_height is not None and prev_snapshot.get('checkpoint_height') is not None:
             if delta_cp < 0:
                 logger.warning(f"Checkpoint counter reset detected for {key} (Δcp={delta_cp})")
                 result["cps"] = None
-                if not result["reason"]:  # Only set if not already set by TPS
-                    result["reason"] = "counter_reset"
+                cps_reason = "counter_reset"
             elif delta_cp == 0:
                 # No new checkpoints - legitimate 0 CPS
                 result["cps"] = 0.0
@@ -237,13 +240,18 @@ class ThroughputCalculator:
                 # Quality check for CPS (checkpoints are typically slower)
                 if result["cps"] > 50:  # Very high CPS threshold
                     logger.warning(f"CPS sanity check: unusually high CPS value {result['cps']} for {key}")
+        elif checkpoint_height is None:
+            cps_reason = "missing_counters"
         
-        # Set reason if no calculations could be made
-        if not has_calculations and not result["reason"]:
-            if total_transactions is None or checkpoint_height is None:
+        # Rule F: Set overall reason only if both metrics have same reason
+        if not has_calculations:
+            if tps_reason == cps_reason and tps_reason is not None:
+                result["reason"] = tps_reason
+            elif total_transactions is None and checkpoint_height is None:
                 result["reason"] = "missing_counters"
             else:
-                result["reason"] = "missing_counters"
+                # Independent failures - let each metric have its own reason in the broader system
+                result["reason"] = None
         
         # Atomically update state after calculation
         if total_transactions is not None and checkpoint_height is not None:
