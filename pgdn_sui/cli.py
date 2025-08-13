@@ -35,10 +35,11 @@ def format_json(data, pretty=False):
 @click.option('--format', type=click.Choice(['json', 'summary']), default='json',
               help='Output format (default: json)')
 @click.option('--enhanced', is_flag=True, help='Include enhanced data (activeValidators, committee info) in advanced mode')
+@click.option('--max-sample-length', type=int, default=200, help='Maximum sample length for truncation (default: 200, debug mode avoids truncation)')
 @click.option('--pretty', is_flag=True, help='Pretty-print JSON output (default: compact)')
 @click.option('--debug', is_flag=True, help='Enable debug logging')
 @click.option('--quiet', is_flag=True, help='Suppress output except results')
-def cli(mode, hostnames, input_file, input_json, timeout, workers, output, format, enhanced, pretty, debug, quiet):
+def cli(mode, hostnames, input_file, input_json, timeout, workers, output, format, enhanced, max_sample_length, pretty, debug, quiet):
     """PGDN-SUI: Enhanced Sui network scanner with discovery, deep analysis, and advanced data extraction modes"""
     
     # Set up logging
@@ -158,7 +159,12 @@ def cli(mode, hostnames, input_file, input_json, timeout, workers, output, forma
                     nodes_data.append(node_dict)
                 
                 # Create extractor with the data
-                extractor_config = {'timeout': timeout, 'enhanced': enhanced}
+                extractor_config = {
+                    'timeout': timeout, 
+                    'enhanced': enhanced,
+                    'debug': debug,
+                    'max_sample_length': max_sample_length
+                }
                 extractor = SuiDataExtractor(extractor_config)
                 extractor.discovery_data = nodes_data
                 
@@ -170,7 +176,12 @@ def cli(mode, hostnames, input_file, input_json, timeout, workers, output, forma
                 if hostnames:
                     click.echo("Warning: --hostnames ignored when using --input-file or --input-json", err=True)
                 
-                extractor_config = {'timeout': timeout, 'enhanced': enhanced}
+                extractor_config = {
+                    'timeout': timeout, 
+                    'enhanced': enhanced,
+                    'debug': debug,
+                    'max_sample_length': max_sample_length
+                }
                 
                 if input_file:
                     if not quiet:

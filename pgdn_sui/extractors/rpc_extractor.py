@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 RPC Extractor
-Handles JSON-RPC extraction from Sui nodes
+Handles JSON-RPC extraction from Sui nodes with token bucket rate limiting
 """
 
 import json
@@ -11,6 +11,7 @@ import logging
 import requests
 from typing import List, Dict, Any, Optional
 from ..models import SuiDataResult
+from ..rate_limiter import get_rate_limiter
 
 logger = logging.getLogger(__name__)
 
@@ -45,9 +46,36 @@ class RpcExtractor:
     def __init__(self, timeout: int = 10, config: Dict = None):
         self.timeout = timeout
         self.config = config or {}
+        self.debug_mode = self.config.get('debug', False)
+        self.max_sample_length = self.config.get('max_sample_length', 200)
         self.logger = logger
         self.backoff_delay = 0.5  # Rule 6: Base 500ms backoff
         self.max_backoff_delay = 5.0  # Rule 6: Cap at 5s
+        self.rate_limiter = get_rate_limiter()  # Token bucket rate limiter
+        
+        # Essential methods that should always be attempted (even when rate limited)
+        self.essential_methods = {
+            "sui_getChainIdentifier",
+            "suix_getLatestSuiSystemState", 
+            "sui_getLatestCheckpointSequenceNumber",
+            "suix_getCommitteeInfo"
+        }
+        
+        # Non-essential methods that can be skipped when rate limited
+        self.non_essential_methods = {
+            "suix_getValidatorsApy",
+            "sui_getTotalTransactionBlocks", 
+            "suix_getReferenceGasPrice",
+            "sui_getProtocolConfig",
+            "rpc.discover",
+            "suix_getAllBalances",
+            "sui_tryGetPastObject",
+            "suix_getCoinMetadata",
+            "suix_getStakes",
+            "sui_getValidators",
+            "suix_queryObjects",
+            "sui_getCheckpoint"
+        }
     
     def _build_rpc_permutations(self, ip: str) -> List[str]:
         """Build RPC endpoint permutations exactly as specified in user requirements"""
@@ -95,6 +123,39 @@ class RpcExtractor:
         
         return False
     
+    def _should_make_request(self, endpoint: str, method: str, is_rate_limited: bool = False) -> bool:
+        """
+        Determine if we should make a request based on rate limiting and method priority
+        
+        Args:
+            endpoint: RPC endpoint URL
+            method: RPC method name
+            is_rate_limited: Whether this host is currently rate limited
+            
+        Returns:
+            True if request should be made, False if skipped
+        """
+        # Always check token bucket first (applies to all requests)
+        if not self.rate_limiter.can_make_request(endpoint):
+            self.logger.info(f"Token bucket rate limit: skipping {method} for {endpoint}")
+            return False
+        
+        # If host is rate limited (429/error responses), only allow essential methods
+        if is_rate_limited:
+            if method in self.essential_methods:
+                self.logger.info(f"Rate limited but essential: allowing {method} for {endpoint}")
+                return True
+            elif method in self.non_essential_methods:
+                self.logger.info(f"Rate limited, skipping non-essential: {method} for {endpoint}")
+                return False
+            else:
+                # Unknown method - treat as non-essential when rate limited
+                self.logger.info(f"Rate limited, skipping unknown method: {method} for {endpoint}")
+                return False
+        
+        # Not rate limited - allow all requests (token bucket already checked)
+        return True
+    
     def _apply_exponential_backoff(self) -> None:
         """
         Rule 6: Apply exponential backoff with jitter (base 500ms, max 5s)
@@ -124,6 +185,11 @@ class RpcExtractor:
             try:
                 self.logger.info(f"Testing RPC endpoint: {endpoint}")
                 
+                # Check token bucket rate limit before making request
+                if not self._should_make_request(endpoint, "sui_getChainIdentifier", False):
+                    self.logger.info(f"Skipping initial connectivity test for {endpoint} due to rate limiting")
+                    continue
+                
                 # Test basic connectivity and authentication with short timeouts
                 start_time = time.time()
                 test_response = requests.post(endpoint, json={
@@ -143,6 +209,8 @@ class RpcExtractor:
                     result.rpc_rate_limit_events += 1
                     result.rpc_status = "rate_limited"
                     result.rpc_reachable = True  # Rule 1: HTTP 429 = reachable
+                    if hasattr(result, 'set_evidence'):
+                        result.set_evidence("rpc", "rate_limited (429)")
                     self.logger.warning(f"Rate limit detected (HTTP 429) on RPC endpoint {endpoint}")
                     self._apply_exponential_backoff()
                     continue
@@ -164,6 +232,8 @@ class RpcExtractor:
                             result.rpc_rate_limit_events += 1
                             result.rpc_status = "rate_limited"
                             result.rpc_reachable = True  # Rule 1: Rate limit after successful TLS = reachable
+                            if hasattr(result, 'set_evidence'):
+                                result.set_evidence("rpc", "rate_limited (body)")
                             self.logger.warning(f"Rate limit detected on RPC endpoint {endpoint}")
                             # Apply backoff for remaining requests in this run
                             self._apply_exponential_backoff()
@@ -175,6 +245,8 @@ class RpcExtractor:
                             # Set RPC status to reachable
                             result.rpc_status = "reachable"
                             result.rpc_reachable = True  # Rule 1: HTTP 200 JSON-RPC response = reachable
+                            if hasattr(result, 'set_evidence'):
+                                result.set_evidence("rpc", "reachable")
                             
                             # Process the chain identifier immediately
                             result.chain_identifier = str(response_data["result"])
@@ -286,8 +358,16 @@ class RpcExtractor:
         
         self.logger.info(f"RPC EXTRACTION: Starting comprehensive analysis with {total_methods} methods")
         
+        # Track if this host is currently rate limited for method prioritization
+        host_is_rate_limited = (result.rpc_status == "rate_limited")
+        
         for method, params in all_methods:
             try:
+                # Check if we should make this request based on rate limiting and method priority
+                if not self._should_make_request(endpoint, method, host_is_rate_limited):
+                    self.logger.info(f"SKIPPING: RPC method {method} due to rate limiting")
+                    continue
+                
                 self.logger.info(f"TESTING: RPC method {method} with params: {params}")
                 
                 response = requests.post(endpoint, json={
@@ -303,6 +383,7 @@ class RpcExtractor:
                     if result.rpc_status != "rate_limited":
                         result.rpc_status = "rate_limited"
                         result.rpc_reachable = True  # Rule 1: HTTP 429 = reachable
+                        host_is_rate_limited = True  # Update local flag for method prioritization
                     self.logger.warning(f"Rate limit hit on method {method}, applying backoff")
                     self._apply_exponential_backoff()
                     continue  # Skip this method but continue with others
@@ -316,6 +397,7 @@ class RpcExtractor:
                         if result.rpc_status != "rate_limited":
                             result.rpc_status = "rate_limited"
                             result.rpc_reachable = True  # Rule 1: Rate limit after successful TLS = reachable
+                            host_is_rate_limited = True  # Update local flag for method prioritization
                         self.logger.warning(f"Rate limit detected in JSON response for method {method}")
                         self._apply_exponential_backoff()
                         continue  # Skip this method but continue with others
@@ -504,13 +586,13 @@ class RpcExtractor:
                 }
                 self.logger.info(f"SUI coin metadata: {data.get('symbol')} ({data.get('decimals')} decimals)")
                 
-            # Store raw data for debugging (but limit size)
-            if method in ["suix_getLatestSuiSystemState", "suix_getCommitteeInfo"] and not self.config.get('enhanced', False):
-                # Store a smaller sample for debugging when not in enhanced mode
-                sample_data = str(data)[:500] + "... [truncated]" if len(str(data)) > 500 else str(data)
-                result.metrics_snapshot[f"rpc_{method}_sample"] = sample_data
-            else:
-                result.metrics_snapshot[f"rpc_{method}_sample"] = str(data)[:200] if isinstance(data, (dict, list)) else str(data)
+            # Store raw data using consistent sample handling
+            sample_key = f"rpc_{method}_sample"
+            sample_data = str(data) if isinstance(data, (dict, list)) else str(data)
+            
+            # Use the model's store_sample method for consistent truncation
+            stored_sample = result.store_sample(sample_key, sample_data, self.debug_mode)
+            result.metrics_snapshot[sample_key] = stored_sample
             
         except Exception as e:
             result.extraction_errors.append(f"rpc_processing_error_{method}: {str(e)}")

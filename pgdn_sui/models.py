@@ -132,6 +132,16 @@ class SuiDataResult:
     node_role: Optional[str] = None  # validator, public_rpc, metrics, hybrid, unknown
     has_narwhal_metrics: bool = False
     narwhal_missing_reason: Optional[str] = None  # not_validator_like, metrics_closed, metrics_gated, missing_metrics_data
+    
+    # Evidence strings (≤128 chars) for specific conditions
+    metrics_evidence: Optional[str] = None  # "metrics closed (timeout)", "rate_limited (429)"
+    rpc_evidence: Optional[str] = None  # "reachable", "rate_limited (429)"
+    grpc_evidence: Optional[str] = None  # "grpc ok (reflection)", "grpc blocked"
+    throughput_evidence: Optional[str] = None  # "delta ok: cps=4.12/37930.4s"
+    
+    # Debug mode sample storage (full samples when debug enabled)
+    debug_samples: Optional[Dict[str, str]] = None  # Full samples for debug mode
+    max_sample_length: int = 200  # Default truncation length
 
     def __post_init__(self):
         if self.peer_info is None:
@@ -168,3 +178,35 @@ class SuiDataResult:
             self.metrics_surface = {}
         if self.open_ports is None:
             self.open_ports = {}
+        if self.debug_samples is None:
+            self.debug_samples = {}
+    
+    def store_sample(self, key: str, sample_data: str, debug_mode: bool = False) -> str:
+        """Store sample data with appropriate truncation based on debug mode"""
+        if debug_mode:
+            # Store full sample in debug mode
+            if self.debug_samples is None:
+                self.debug_samples = {}
+            self.debug_samples[key] = sample_data
+            return sample_data
+        else:
+            # Truncate for normal mode
+            if len(sample_data) <= self.max_sample_length:
+                return sample_data
+            return sample_data[:self.max_sample_length] + " [truncated]"
+    
+    def set_evidence(self, evidence_type: str, evidence: str) -> None:
+        """Set evidence string with length validation (≤128 chars)"""
+        if len(evidence) > 128:
+            evidence = evidence[:125] + "..."
+        
+        if evidence_type == "metrics":
+            self.metrics_evidence = evidence
+        elif evidence_type == "rpc":
+            self.rpc_evidence = evidence
+        elif evidence_type == "grpc":
+            self.grpc_evidence = evidence
+        elif evidence_type == "throughput":
+            self.throughput_evidence = evidence
+        elif evidence_type == "uptime":
+            self.uptime_evidence = evidence

@@ -363,6 +363,11 @@ class SuiDataExtractor:
             result.node_role = "unknown"
             self.logger.info(f"Node classified as UNKNOWN: No clear capabilities detected")
         
+        # Apply uptime expectation rules for RPC nodes with closed metrics
+        if result.node_role in ["rpc_node", "rpc_node_with_grpc"] and not result.metrics_exposed:
+            result.uptime_expected = False
+            self.logger.info(f"Setting uptime_expected=false for {result.node_role} with closed metrics")
+        
         # Set narwhal_missing_reason based on role and capabilities
         self._set_narwhal_missing_reason(result, grpc_detected)
         
@@ -701,11 +706,29 @@ class SuiDataExtractor:
             # Store in result
             result.network_throughput = throughput_data
             
-            # Log successful calculation (but not null values)
+            # Log successful calculation (but not null values) and set evidence strings
             if throughput_data.get("tps") is not None or throughput_data.get("cps") is not None:
-                self.logger.info(f"Throughput calculated for {ip}: TPS={throughput_data.get('tps')}, CPS={throughput_data.get('cps')}, window={throughput_data.get('calculation_window_seconds')}s")
+                tps = throughput_data.get('tps')
+                cps = throughput_data.get('cps')
+                window = throughput_data.get('calculation_window_seconds')
+                
+                # Create evidence string for successful calculation
+                if tps is not None and cps is not None:
+                    if hasattr(result, 'set_evidence'):
+                        result.set_evidence("throughput", f"delta ok: tps={tps}/cps={cps}/{window:.2f}s")
+                elif cps is not None:
+                    if hasattr(result, 'set_evidence'):
+                        result.set_evidence("throughput", f"delta ok: cps={cps}/{window:.2f}s")
+                elif tps is not None:
+                    if hasattr(result, 'set_evidence'):
+                        result.set_evidence("throughput", f"delta ok: tps={tps}/{window:.2f}s")
+                
+                self.logger.info(f"Throughput calculated for {ip}: TPS={tps}, CPS={cps}, window={window}s")
             else:
-                self.logger.debug(f"Throughput calculation returned null values for {ip}: {throughput_data.get('reason', 'first observation or guardrails triggered')}")
+                reason = throughput_data.get('reason', 'no_data')
+                if hasattr(result, 'set_evidence'):
+                    result.set_evidence("throughput", f"delta failed ({reason})")
+                self.logger.debug(f"Throughput calculation returned null values for {ip}: {reason}")
                 
         except Exception as e:
             self.logger.error(f"Failed to calculate network throughput for {result.ip}: {e}")
@@ -737,6 +760,11 @@ class SuiDataExtractor:
             
             # Don't apply uptime penalties to public nodes
             result.metrics_snapshot["extended_scoring_note"] = "public_node_uptime_neutral"
+            
+        elif result.uptime_expected is False:
+            # RPC nodes with closed metrics: don't penalize for uptime issues
+            result.metrics_snapshot["extended_scoring_neutral"] = "rpc_node_closed_metrics_no_uptime_penalty"
+            self.logger.info(f"RPC node neutral scoring: uptime_expected=false, no uptime penalties applied")
             
         else:
             # Validator/private nodes: apply strict scoring
@@ -792,6 +820,7 @@ class SuiDataExtractor:
             "rpc_reachable": result.rpc_reachable,
             "uptime_status": result.uptime_status,
             "uptime_source": result.uptime_source,
+            "uptime_expected": result.uptime_expected,
             "metrics_exposed": result.metrics_exposed,
             "is_public_node": is_public,
             "score_adjustment": round(extended_score - current_score, 2)

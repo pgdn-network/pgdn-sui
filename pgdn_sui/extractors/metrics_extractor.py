@@ -21,6 +21,8 @@ class MetricsExtractor:
     def __init__(self, timeout: int = 10, config: Dict = None):
         self.timeout = timeout
         self.config = config or {}
+        self.debug_mode = self.config.get('debug', False)
+        self.max_sample_length = self.config.get('max_sample_length', 200)
         self.logger = logger
 
     async def extract_metrics_intelligence_async(self, result: SuiDataResult, ip: str) -> bool:
@@ -44,25 +46,39 @@ class MetricsExtractor:
     async def _extract_dual_port_metrics(self, result: SuiDataResult, ip: str) -> bool:
         """Extract metrics from multiple ports with full permutation coverage"""
         
-        # Ports/paths to try as specified: 9184/metrics (Sui app), 9100/metrics (node-exporter), 8080/metrics (some setups)
-        metrics_ports = [
-            {"port": 9184, "type": "sui_app", "url": f"http://{ip}:9184/metrics"},
-            {"port": 9100, "type": "node_exporter", "url": f"http://{ip}:9100/metrics"},
-            {"port": 8080, "type": "metrics_alt", "url": f"http://{ip}:8080/metrics"}
-        ]
+        # Ports/paths to try as specified: [9184, 9100, 9090, 8080] with paths ["/metrics", "/metrics/prometheus"]
+        ports = [9184, 9100, 9090, 8080]
+        paths = ["/metrics", "/metrics/prometheus"]
+        
+        metrics_endpoints = []
+        port_types = {
+            9184: "sui_app",
+            9100: "node_exporter", 
+            9090: "sui_validator",
+            8080: "metrics_alt"
+        }
+        
+        for port in ports:
+            for path in paths:
+                metrics_endpoints.append({
+                    "port": port,
+                    "path": path,
+                    "type": port_types[port],
+                    "url": f"http://{ip}:{port}{path}"
+                })
         
         # Initialize metrics_surface to track all attempts
         if result.metrics_surface is None:
             result.metrics_surface = {}
         
-        for port_info in metrics_ports:
+        for endpoint_info in metrics_endpoints:
             try:
                 start_time = time.time()
                 headers = {"Accept": "text/plain"}
                 
                 response = requests.get(
-                    port_info["url"],
-                    timeout=(1.5, 2.0),  # connect=1.5s, read=2.0s, retries=1
+                    endpoint_info["url"],
+                    timeout=(2, 8),  # connect=2s, read=8s as specified
                     headers=headers,
                     verify=False
                 )
@@ -70,19 +86,28 @@ class MetricsExtractor:
                 response_time = time.time() - start_time
                 
                 # Track this attempt in metrics_surface
-                result.metrics_surface[str(port_info["port"])] = {
-                    "http_status": str(response.status_code)
+                endpoint_key = f"{endpoint_info['port']}{endpoint_info['path']}"
+                result.metrics_surface[endpoint_key] = {
+                    "http_status": str(response.status_code),
+                    "port": endpoint_info["port"],
+                    "path": endpoint_info["path"]
                 }
                 
                 if response.status_code == 200:
                     metrics_text = response.text
                     
-                    # Rule A: Check if we received valid metrics with non-empty body (>0B)
-                    if len(metrics_text) > 0 and self._is_valid_metrics_response(metrics_text):
-                        result.metrics_exposed = True  # Rule A: HTTP 200 with non-empty body
-                        result.service_response_times[f"metrics_dual_{port_info['port']}"] = response_time
+                    # Check for minimal response (< 64 bytes)
+                    if len(metrics_text) < 64:
+                        result.metrics_surface[endpoint_key]["minimal_response"] = True
+                        self.logger.debug(f"Minimal response from {endpoint_info['url']} ({len(metrics_text)} bytes) - not counting as exposed")
+                        continue
+                    
+                    # Rule A: Check if we received valid metrics with non-empty body (>=64B)
+                    if len(metrics_text) >= 64 and self._is_valid_metrics_response(metrics_text):
+                        result.metrics_exposed = True  # Rule A: HTTP 200 with valid body >=64B
+                        result.service_response_times[f"metrics_dual_{endpoint_info['port']}_{endpoint_info['path'].replace('/', '_')}"] = response_time
                         
-                        self.logger.info(f"Dual port metrics extracted from {port_info['url']} ({len(metrics_text)} bytes)")
+                        self.logger.info(f"Dual port metrics extracted from {endpoint_info['url']} ({len(metrics_text)} bytes)")
                         
                         # Extract uptime with priority-based approach (extend.md requirement)
                         uptime_value, evidence = await self._extract_uptime_with_priority(
@@ -91,7 +116,7 @@ class MetricsExtractor:
                         result.uptime_evidence = evidence[:128]
                         
                         # For node_exporter, mark the uptime source
-                        if port_info["type"] == "node_exporter" and uptime_value:
+                        if endpoint_info["type"] == "node_exporter" and uptime_value:
                             result.uptime_source = "node_exporter"
                         
                         # Extract other metrics
@@ -101,55 +126,62 @@ class MetricsExtractor:
                         await self._classify_public_node(result, ip, response.headers)
                         await self._detect_edge_node(result, ip, response.headers)
                         
-                        result.metrics_snapshot["dual_port_metrics_source"] = port_info["url"]
-                        result.metrics_snapshot["dual_port_metrics_type"] = port_info["type"]
+                        result.metrics_snapshot["dual_port_metrics_source"] = endpoint_info["url"]
+                        result.metrics_snapshot["dual_port_metrics_type"] = endpoint_info["type"]
                         result.metrics_snapshot["dual_port_success"] = True
                         
                         return True
                     else:
-                        # Rule A: HTTP 200 but empty body or invalid → metrics_exposed stays false
-                        self.logger.debug(f"Invalid or empty metrics response from {port_info['url']} (body length: {len(metrics_text)})")
+                        # Rule A: HTTP 200 but invalid content → metrics_exposed stays false
+                        self.logger.debug(f"Invalid metrics response from {endpoint_info['url']} (body length: {len(metrics_text)})")
                         
                 elif response.status_code in [401, 403]:
                     # Rule A: Gated metrics (401/403 with empty body) → metrics_exposed=false
-                    result.metrics_snapshot[f"port_{port_info['port']}_gated"] = True
-                    self.logger.info(f"Metrics gated on port {port_info['port']} (HTTP {response.status_code})")
+                    result.metrics_snapshot[f"endpoint_{endpoint_key}_gated"] = True
+                    self.logger.info(f"Metrics gated on {endpoint_info['url']} (HTTP {response.status_code})")
                     
                 elif response.status_code == 429:
                     # Rule A: Rate limited (429) → metrics_exposed=false
-                    result.metrics_surface[str(port_info["port"])] = {"http_status": "429"}
-                    result.metrics_snapshot[f"port_{port_info['port']}_rate_limited"] = True
-                    self.logger.info(f"Metrics rate limited on port {port_info['port']} (HTTP 429)")
+                    result.metrics_surface[endpoint_key]["http_status"] = "429"
+                    result.metrics_snapshot[f"endpoint_{endpoint_key}_rate_limited"] = True
+                    if hasattr(result, 'set_evidence'):
+                        result.set_evidence("metrics", "rate_limited (429)")
+                    self.logger.info(f"Metrics rate limited on {endpoint_info['url']} (HTTP 429)")
                     
                 elif response.status_code == 404:
                     # Rule A: Closed metrics (404) → metrics_exposed=false
-                    result.metrics_snapshot[f"port_{port_info['port']}_closed"] = True
-                    self.logger.debug(f"Metrics endpoint not found on port {port_info['port']} (HTTP 404)")
+                    result.metrics_snapshot[f"endpoint_{endpoint_key}_closed"] = True
+                    self.logger.debug(f"Metrics endpoint not found at {endpoint_info['url']} (HTTP 404)")
                     
             except requests.exceptions.Timeout:
                 # Track timeout in metrics_surface as "closed"
-                result.metrics_surface[str(port_info["port"])] = {"http_status": "closed"}
-                result.metrics_snapshot[f"port_{port_info['port']}_timeout"] = True
-                self.logger.debug(f"Metrics timeout on port {port_info['port']}")
+                result.metrics_surface[endpoint_key] = {"http_status": "closed", "port": endpoint_info["port"], "path": endpoint_info["path"]}
+                result.metrics_snapshot[f"endpoint_{endpoint_key}_timeout"] = True
+                if hasattr(result, 'set_evidence'):
+                    result.set_evidence("metrics", "metrics closed (timeout)")
+                self.logger.debug(f"Metrics timeout on {endpoint_info['url']}")
                 
             except requests.exceptions.ConnectionError as e:
                 # Track connection errors in metrics_surface as "closed"
-                result.metrics_surface[str(port_info["port"])] = {"http_status": "closed"}
+                result.metrics_surface[endpoint_key] = {"http_status": "closed", "port": endpoint_info["port"], "path": endpoint_info["path"]}
                 if "Connection refused" in str(e):
-                    result.metrics_snapshot[f"port_{port_info['port']}_connection_refused"] = True
-                    self.logger.debug(f"Metrics connection refused on port {port_info['port']}")
+                    result.metrics_snapshot[f"endpoint_{endpoint_key}_connection_refused"] = True
+                    self.logger.debug(f"Metrics connection refused on {endpoint_info['url']}")
                 else:
-                    self.logger.debug(f"Metrics connection error on port {port_info['port']}: {e}")
+                    self.logger.debug(f"Metrics connection error on {endpoint_info['url']}: {e}")
                     
             except Exception as e:
                 # Track other errors in metrics_surface as "closed"
-                result.metrics_surface[str(port_info["port"])] = {"http_status": "closed"}
-                self.logger.debug(f"Metrics extraction error on port {port_info['port']}: {e}")
+                result.metrics_surface[endpoint_key] = {"http_status": "closed", "port": endpoint_info["port"], "path": endpoint_info["path"]}
+                self.logger.debug(f"Metrics extraction error on {endpoint_info['url']}: {e}")
         
         # Rule A: Set metrics_exposed=true ONLY if at least one metrics attempt returned HTTP 200 with NON-EMPTY body (>0B)
         # If every attempt is timeout/connection error/404/closed → metrics_exposed=false
         # If any attempt is 401/403/429 with empty body → metrics_exposed=false (they're gated)
         result.metrics_exposed = False  # Default to false, only set true if we have valid metrics
+        
+        # Mark that dual port extraction has been attempted
+        result.metrics_snapshot["dual_port_attempted"] = True
         
         return False
     
@@ -190,10 +222,10 @@ class MetricsExtractor:
             # Headers and timeouts as specified in prompt.md
             headers = {"Accept": "text/plain"}
             
-            # Timeouts: connect 2s, read 2s as specified
+            # Timeouts: connect 2s, read 8s as specified
             response = requests.get(
                 primary_endpoint, 
-                timeout=(2, 2),  # (connect_timeout, read_timeout)
+                timeout=(2, 8),  # (connect_timeout, read_timeout)
                 headers=headers,
                 verify=False
             )
@@ -218,11 +250,11 @@ class MetricsExtractor:
                     await self._detect_edge_node(result, ip, response.headers)
                     return False
                 
-                # Check if response is empty or too small to be valid metrics
-                if not metrics_text or len(metrics_text.strip()) < 10:
-                    self.logger.warning(f"TDD metrics endpoint {primary_endpoint} returned empty or minimal response ({len(metrics_text)} bytes)")
-                    # Rule A: HTTP 200 but empty/minimal body → metrics_exposed stays false (no valid content)
-                    result.metrics_snapshot["tdd_metrics_empty"] = True
+                # Check for minimal response (< 64 bytes)
+                if len(metrics_text) < 64:
+                    self.logger.warning(f"TDD metrics endpoint {primary_endpoint} returned minimal response ({len(metrics_text)} bytes)")
+                    # Mark as minimal_response and don't count as exposed
+                    result.metrics_snapshot["tdd_metrics_minimal_response"] = True
                     
                     # Extract uptime with priority-based approach for empty response
                     uptime_value, evidence = await self._extract_uptime_with_priority(result, "", response.status_code, "empty_response")
@@ -329,7 +361,7 @@ class MetricsExtractor:
                     self.logger.debug(f"TDD metrics network error, retrying once: {e}")
                     response = requests.get(
                         primary_endpoint,
-                        timeout=(2, 2),
+                        timeout=(2, 8),
                         headers=headers, 
                         verify=False
                     )
@@ -380,9 +412,9 @@ class MetricsExtractor:
     
     async def _extract_comprehensive_metrics(self, result: SuiDataResult, ip: str) -> bool:
         """Enhanced metrics intelligence extraction with better validator detection (original logic)"""
-        # Skip comprehensive extraction if TDD was already successful
-        if result.metrics_snapshot.get("tdd_metrics_success"):
-            self.logger.debug("TDD metrics already extracted, skipping comprehensive extraction")
+        # Skip comprehensive extraction if TDD was successful or dual port was attempted (to preserve detailed endpoint tracking)
+        if result.metrics_snapshot.get("tdd_metrics_success") or result.metrics_snapshot.get("dual_port_success") or result.metrics_snapshot.get("dual_port_attempted"):
+            self.logger.debug("Metrics already extracted via TDD or dual port attempted, skipping comprehensive extraction")
             return True
             
         # Comprehensive metrics endpoint mapping (original logic)
@@ -986,12 +1018,18 @@ class MetricsExtractor:
             else:
                 return None, "metrics 200 but empty response"
         
+        # Handle 0 bytes response as "closed"
+        if len(metrics_text) == 0:
+            result.uptime_status = "closed"
+            result.uptime_seconds_total = None
+            return None, "metrics 200 but 0 bytes"
+        
         # Priority 1: uptime_seconds_total (validator app)
         uptime_pattern = r'^uptime_seconds_total\s+(\d+)\s*$'
         match = re.search(uptime_pattern, metrics_text, re.MULTILINE)
         if match:
             uptime_seconds = int(match.group(1))
-            result.uptime_status = "available"
+            result.uptime_status = "ok"  # 200 + uptime metric found → "ok"
             result.uptime_seconds_total = uptime_seconds
             return uptime_seconds, f"uptime={uptime_seconds}s"
         
@@ -1003,7 +1041,7 @@ class MetricsExtractor:
                 start_time = float(match.group(1))
                 uptime_seconds = int(current_time - start_time)
                 if uptime_seconds > 0:
-                    result.uptime_status = "available"
+                    result.uptime_status = "ok"  # 200 + uptime metric found → "ok"
                     result.uptime_seconds_total = uptime_seconds
                     start_datetime = datetime.fromtimestamp(start_time).strftime("%Y-%m-%dT%H:%M:%SZ")
                     return uptime_seconds, f"start={start_datetime} (process_start_time_seconds)"
@@ -1016,7 +1054,7 @@ class MetricsExtractor:
         if match:
             try:
                 uptime_seconds = int(float(match.group(1)))
-                result.uptime_status = "available"
+                result.uptime_status = "ok"  # 200 + uptime metric found → "ok"
                 result.uptime_seconds_total = uptime_seconds
                 return uptime_seconds, f"uptime={uptime_seconds}s (process_uptime_seconds)"
             except ValueError:
@@ -1030,7 +1068,7 @@ class MetricsExtractor:
                 boot_time = float(match.group(1))
                 uptime_seconds = int(current_time - boot_time)
                 if uptime_seconds > 0:
-                    result.uptime_status = "available"
+                    result.uptime_status = "ok"  # 200 + uptime metric found → "ok"
                     result.uptime_seconds_total = uptime_seconds
                     result.metrics_snapshot["uptime_source"] = "node_exporter"
                     boot_datetime = datetime.fromtimestamp(boot_time).strftime("%Y-%m-%dT%H:%M:%SZ")
