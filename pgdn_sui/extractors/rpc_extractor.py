@@ -12,6 +12,7 @@ import requests
 from typing import List, Dict, Any, Optional
 from ..models import SuiDataResult
 from ..rate_limiter import get_rate_limiter
+from ..throughput_bands import ThroughputBandCalculator
 
 logger = logging.getLogger(__name__)
 
@@ -667,7 +668,7 @@ class RpcExtractor:
         return False
 
     def calculate_batch_metrics(self, results: List[SuiDataResult]):
-        """Calculate checkpoint lag and transaction throughput across the scan batch"""
+        """Calculate checkpoint lag, transaction throughput, and performance bands across the scan batch"""
         if not results:
             return
             
@@ -686,7 +687,7 @@ class RpcExtractor:
             for result in results:
                 if result.checkpoint_height:
                     result.checkpoint_lag = max_checkpoint - result.checkpoint_height
-                    self.logger.info(f"Node {result.ip} checkpoint lag: {result.checkpoint_lag} blocks")
+                    self.logger.debug(f"Node {result.ip} checkpoint lag: {result.checkpoint_lag} blocks")
         
         # Calculate transaction throughput TPS from delta (if we had previous scan data)
         # For now, store the transaction counts for future delta calculations
@@ -697,5 +698,9 @@ class RpcExtractor:
                     "timestamp": time.time(),
                     "checkpoint": result.checkpoint_height
                 }
-                
-        self.logger.info(f"Batch analysis complete: max checkpoint {max_checkpoint}, {len(checkpoint_nodes)} nodes with checkpoint data")
+        
+        # Calculate throughput performance bands relative to batch
+        band_calculator = ThroughputBandCalculator()
+        band_summary = band_calculator.calculate_batch_bands(results)
+        
+        self.logger.info(f"Batch analysis complete: max checkpoint {max_checkpoint}, {len(checkpoint_nodes)} nodes with checkpoint data, throughput bands calculated")

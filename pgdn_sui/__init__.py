@@ -10,7 +10,7 @@ from .utils import calculate_gini_coefficient, get_primary_port
 from .exceptions import *
 
 
-__version__ = "2.11.0"
+__version__ = "2.12.0"
 __author__ = "PGDN Team"
 
 __all__ = [

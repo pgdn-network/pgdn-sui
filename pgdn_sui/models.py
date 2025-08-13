@@ -142,6 +142,11 @@ class SuiDataResult:
     # Debug mode sample storage (full samples when debug enabled)
     debug_samples: Optional[Dict[str, str]] = None  # Full samples for debug mode
     max_sample_length: int = 200  # Default truncation length
+    
+    # Throughput performance bands relative to network batch
+    tps_band: Optional[str] = None  # "low", "normal", "high" relative to batch p10/p50/p95
+    cps_band: Optional[str] = None  # "low", "normal", "high" relative to batch p10/p50/p95
+    batch_stats: Optional[Dict[str, Any]] = None  # Batch percentile context for debugging
 
     def __post_init__(self):
         if self.peer_info is None:

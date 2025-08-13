@@ -18,6 +18,7 @@ from .protobuf_manager import SuiProtobufManager
 from .utils import get_primary_port, calculate_gini_coefficient
 from .response_format import standard_response, format_json
 from .throughput_calculator import ThroughputCalculator
+from .throughput_bands import get_band_summary_for_evidence
 from .extractors import (
     RpcExtractor, 
     GrpcExtractor, 
@@ -246,7 +247,37 @@ class SuiDataExtractor:
         except Exception as e:
             self.logger.error(f"Batch metrics calculation failed: {e}")
         
+        # Update evidence strings with band information after batch processing
+        try:
+            self._update_throughput_evidence_with_bands(results)
+            self.logger.debug("Throughput evidence updated with band information")
+        except Exception as e:
+            self.logger.error(f"Failed to update evidence with bands: {e}")
+        
         return results
+
+    def _update_throughput_evidence_with_bands(self, results: List[SuiDataResult]) -> None:
+        """Update throughput evidence strings to include band information after batch processing"""
+        for result in results:
+            if (result.network_throughput and hasattr(result, 'set_evidence')):
+                tps = result.network_throughput.get('tps')
+                cps = result.network_throughput.get('cps')
+                window = result.network_throughput.get('calculation_window_seconds')
+                
+                # Get band information 
+                tps_band = getattr(result, 'tps_band', None)
+                cps_band = getattr(result, 'cps_band', None)
+                
+                # Update evidence string with band information
+                if tps is not None or cps is not None:
+                    band_summary = get_band_summary_for_evidence(tps, cps, tps_band, cps_band)
+                    
+                    if window:
+                        result.set_evidence("throughput", f"delta ok: {band_summary}/{window:.2f}s")
+                    else:
+                        result.set_evidence("throughput", f"delta ok: {band_summary}")
+                        
+                    self.logger.debug(f"Updated throughput evidence for {result.ip}: {band_summary}")
 
     async def _extract_node_intelligence_async(self, node_data: Dict) -> SuiDataResult:
         """Extract comprehensive intelligence from a single Sui node"""
