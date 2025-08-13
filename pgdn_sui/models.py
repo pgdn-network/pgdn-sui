@@ -84,6 +84,7 @@ class SuiDataResult:
     # Service availability intelligence
     rpc_exposed: bool = False
     rpc_authenticated: bool = False
+    rpc_reachable: bool = False  # Rule 1: HTTP 200 JSON-RPC response OR HTTP 429/rate limit after TLS
     rpc_status: Optional[str] = None  # "reachable", "unreachable", "rate_limited" (extend.md requirement)
     rpc_methods_available: List[str] = None
     rpc_rate_limit_events: int = 0  # Rule C: Count of rate limit events in this run

@@ -315,33 +315,37 @@ class SuiDataExtractor:
 
     def _classify_node_role(self, result: SuiDataResult):
         """
-        Rule D: Stricter capability-only node role classification (no provider allowlists)
+        Rule 3: Exact node role classification with the specified names
         
-        has_narwhal_metrics := true if any metrics body (200) contains lines starting with "narwhal_" OR "consensus_"
-        grpc_detected := true if TCP connect to 50051 or 8080 succeeds
+        Derive booleans:
+        grpc_detected := TCP connect success to 50051 or 8080 (or grpc health OK)
+        has_narwhal_metrics := metrics_exposed == true AND metrics text contains prefixes {"narwhal_","consensus_"}
         
         Classification:
-        1) If has_narwhal_metrics==true → node_role="validator_candidate"
-        2) Else if rpc_reachable==true AND grpc_detected==true → node_role="rpc_node_with_grpc"
-        3) Else if rpc_reachable==true → node_role="rpc_node"
-        4) Else if metrics_exposed==true → node_role="metrics_only"
-        5) Else → node_role="unknown"
+        1) If has_narwhal_metrics → "validator"
+        2) Else if rpc_reachable and grpc_detected → "rpc_node_with_grpc"
+        3) Else if rpc_reachable → "rpc_node"
+        4) Else if metrics_exposed → "metrics"
+        5) Else → "unknown"
         """
         
-        # Rule D: Detect gRPC presence via TCP connect to 50051 or 8080
+        # Rule 3: Detect gRPC presence via TCP connect to 50051 or 8080 (or grpc health OK)
         grpc_detected = (
             result.grpc_available or 
             (hasattr(result, 'open_ports') and result.open_ports and 
              result.open_ports.get('grpc', []))
         )
         
-        # Check if RPC is reachable (not rate_limited either)
-        rpc_reachable = result.rpc_status == "reachable"
+        # Rule 3: Use rpc_reachable from Rule 1 (HTTP 200 or 429/rate limit)
+        rpc_reachable = result.rpc_reachable
         
-        # Rule D: Classification logic based on exact specification
-        if result.has_narwhal_metrics:
-            result.node_role = "validator_candidate"
-            self.logger.info(f"Node classified as VALIDATOR_CANDIDATE: Narwhal metrics detected")
+        # Rule 3: has_narwhal_metrics requires both metrics_exposed AND narwhal/consensus prefixes
+        has_narwhal_metrics = result.metrics_exposed and result.has_narwhal_metrics
+        
+        # Rule 3: Classification logic with exact names
+        if has_narwhal_metrics:
+            result.node_role = "validator"
+            self.logger.info(f"Node classified as VALIDATOR: Narwhal metrics detected")
                 
         elif rpc_reachable and grpc_detected:
             result.node_role = "rpc_node_with_grpc"
@@ -352,8 +356,8 @@ class SuiDataExtractor:
             self.logger.info(f"Node classified as RPC_NODE: RPC reachable only")
             
         elif result.metrics_exposed:
-            result.node_role = "metrics_only"
-            self.logger.info(f"Node classified as METRICS_ONLY: Metrics exposed, RPC not reachable")
+            result.node_role = "metrics"
+            self.logger.info(f"Node classified as METRICS: Metrics exposed, RPC not reachable")
             
         else:
             result.node_role = "unknown"
@@ -362,16 +366,14 @@ class SuiDataExtractor:
         # Set narwhal_missing_reason based on role and capabilities
         self._set_narwhal_missing_reason(result, grpc_detected)
         
-        # Store classification evidence
+        # Rule 4: Store classification evidence block (consistent format)
         result.metrics_snapshot["classification"] = {
-            "node_role": result.node_role,
             "evidence": {
                 "rpc_reachable": rpc_reachable,
-                "has_narwhal_metrics": result.has_narwhal_metrics,
                 "grpc_detected": grpc_detected,
+                "has_narwhal_metrics": has_narwhal_metrics,
                 "metrics_exposed": result.metrics_exposed
-            },
-            "narwhal_missing_reason": result.narwhal_missing_reason
+            }
         }
 
     def _set_narwhal_missing_reason(self, result: SuiDataResult, grpc_detected: bool):
@@ -386,9 +388,9 @@ class SuiDataExtractor:
             result.narwhal_missing_reason = None  # No reason needed
             return
         
-        # Rule E: Only check narwhal expectations for validator_candidate nodes
-        if result.node_role == "validator_candidate":
-            # This shouldn't happen since validator_candidate requires has_narwhal_metrics=true
+        # Rule E: Only check narwhal expectations for validator nodes
+        if result.node_role == "validator":
+            # This shouldn't happen since validator requires has_narwhal_metrics=true
             result.narwhal_missing_reason = "missing_metrics_data"
             return
         
@@ -740,10 +742,15 @@ class SuiDataExtractor:
             # Validator/private nodes: apply strict scoring
             
             # Mark down nodes that have no reachable RPC (cannot participate in network queries)
-            if result.rpc_status == "unreachable":
+            if not result.rpc_reachable:
                 health_issues.append("rpc_unreachable_marked_down")
                 extended_score -= 0.3
                 self.logger.warning(f"Validator marked down: No reachable RPC endpoints")
+            
+            # Rule 7: If rpc_status="rate_limited" but rpc_reachable=true → no penalty
+            if result.rpc_status == "rate_limited" and result.rpc_reachable:
+                result.metrics_snapshot["extended_scoring_neutral"] = "rate_limited_but_reachable"
+                self.logger.info(f"Validator neutral scoring: Rate limited but still reachable")
             
             # Check for nodes that hide all uptime metrics while exposing other metrics publicly
             # This indicates partial hardening, not full security
@@ -758,24 +765,31 @@ class SuiDataExtractor:
                     self.logger.warning(f"Validator marked down: Hiding uptime metrics while exposing other metrics (partial hardening)")
             
             # Neutral scoring for nodes that gate metrics entirely (403/401) but have healthy RPC
-            if (result.rpc_status == "reachable" and 
+            if (result.rpc_reachable and 
                 not result.metrics_exposed and 
                 any(result.metrics_snapshot.get(f"port_{port}_gated", False) for port in [9184, 9100])):
                 # This is neutral - don't penalize or boost
                 result.metrics_snapshot["extended_scoring_neutral"] = "gated_metrics_healthy_rpc"
                 self.logger.info(f"Validator neutral scoring: Gated metrics but healthy RPC")
             
-            # Mark up nodes that have both RPC and uptime metrics available and correct
-            if (result.rpc_status == "reachable" and 
+            # Rule 7: Mark up nodes that have both RPC and uptime metrics available and correct
+            if (result.rpc_reachable and 
                 result.uptime_status == "available" and 
                 result.uptime_seconds_total is not None):
                 health_issues.append("rpc_and_uptime_available_marked_up")
                 extended_score += 0.1  # Boost score for fully accessible nodes
                 self.logger.info(f"Validator marked up: Both RPC and uptime metrics are exposed and correct")
+            
+            # Rule 7: Boost score for validators with exposed metrics
+            if result.node_role == "validator" and result.metrics_exposed:
+                extended_score += 0.1
+                health_issues.append("validator_with_metrics_marked_up")
+                self.logger.info(f"Validator marked up: Validator role with exposed metrics")
         
         # Store extended scoring metadata
         result.metrics_snapshot["extended_scoring"] = {
             "rpc_status": result.rpc_status,
+            "rpc_reachable": result.rpc_reachable,
             "uptime_status": result.uptime_status,
             "uptime_source": result.uptime_source,
             "metrics_exposed": result.metrics_exposed,

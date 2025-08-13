@@ -46,8 +46,8 @@ class RpcExtractor:
         self.timeout = timeout
         self.config = config or {}
         self.logger = logger
-        self.backoff_delay = 0.25  # Rule C: Base 250ms backoff
-        self.max_backoff_delay = 2.0  # Rule C: Cap at 2s
+        self.backoff_delay = 0.5  # Rule 6: Base 500ms backoff
+        self.max_backoff_delay = 5.0  # Rule 6: Cap at 5s
     
     def _build_rpc_permutations(self, ip: str) -> List[str]:
         """Build RPC endpoint permutations exactly as specified in user requirements"""
@@ -97,7 +97,8 @@ class RpcExtractor:
     
     def _apply_exponential_backoff(self) -> None:
         """
-        Rule C: Apply exponential backoff with jitter (base 250ms, cap 2s)
+        Rule 6: Apply exponential backoff with jitter (base 500ms, max 5s)
+        On first 429 per host, switch subsequent RPC calls in this run to exponential backoff
         """
         # Add jitter (±25% random variation)
         jitter = random.uniform(0.75, 1.25)
@@ -115,8 +116,9 @@ class RpcExtractor:
         # Extended RPC endpoint permutations as specified in extend.md
         rpc_endpoints = self._build_rpc_permutations(ip)
         
-        # Set initial RPC status
+        # Set initial RPC status and reachability
         result.rpc_status = "unreachable"
+        result.rpc_reachable = False
         
         for endpoint in rpc_endpoints:
             try:
@@ -136,10 +138,11 @@ class RpcExtractor:
                 
                 self.logger.info(f"RPC {endpoint} responded with status {test_response.status_code} in {response_time:.3f}s")
                 
-                # Rule C: Check for HTTP 429 rate limiting first
+                # Rule 1a: Check for HTTP 429 rate limiting first - this counts as reachable
                 if test_response.status_code == 429:
                     result.rpc_rate_limit_events += 1
                     result.rpc_status = "rate_limited"
+                    result.rpc_reachable = True  # Rule 1: HTTP 429 = reachable
                     self.logger.warning(f"Rate limit detected (HTTP 429) on RPC endpoint {endpoint}")
                     self._apply_exponential_backoff()
                     continue
@@ -156,10 +159,11 @@ class RpcExtractor:
                         response_data = test_response.json()
                         self.logger.info(f"RPC response: {str(response_data)[:200]}...")
                         
-                        # Rule C: Check for rate limiting
+                        # Rule 1b: Check for rate limiting in JSON body - this counts as reachable
                         if self._detect_rate_limit(test_response, response_data):
                             result.rpc_rate_limit_events += 1
                             result.rpc_status = "rate_limited"
+                            result.rpc_reachable = True  # Rule 1: Rate limit after successful TLS = reachable
                             self.logger.warning(f"Rate limit detected on RPC endpoint {endpoint}")
                             # Apply backoff for remaining requests in this run
                             self._apply_exponential_backoff()
@@ -170,6 +174,7 @@ class RpcExtractor:
                             
                             # Set RPC status to reachable
                             result.rpc_status = "reachable"
+                            result.rpc_reachable = True  # Rule 1: HTTP 200 JSON-RPC response = reachable
                             
                             # Process the chain identifier immediately
                             result.chain_identifier = str(response_data["result"])
@@ -196,6 +201,7 @@ class RpcExtractor:
                                 self.logger.info(f"PARTIAL: RPC endpoint {endpoint} is working but method not supported")
                                 # Set RPC status to reachable
                                 result.rpc_status = "reachable"
+                                result.rpc_reachable = True  # Rule 1: HTTP 200 JSON-RPC response = reachable
                                 # Try other methods on this endpoint
                                 await self._extract_comprehensive_rpc_intelligence(result, endpoint)
                                 return True
@@ -226,7 +232,12 @@ class RpcExtractor:
                 self.logger.debug(f"RPC endpoint {endpoint} error: {e}")
                 continue
         
-        self.logger.warning(f"FAILED: No working RPC endpoints found for {ip}")
+        # Rule 1: Only set unreachable if ALL attempts failed with timeout/TLS/DNS errors/connection refused
+        # If we got any HTTP responses (even 404/500), that means TLS worked
+        if not result.rpc_reachable:
+            result.rpc_status = "unreachable"  # All attempts failed with connection-level errors
+        
+        self.logger.warning(f"FAILED: No working RPC endpoints found for {ip}, final status: {result.rpc_status}")
         return False
 
     async def _extract_comprehensive_rpc_intelligence(self, result: SuiDataResult, endpoint: str):
@@ -286,11 +297,12 @@ class RpcExtractor:
                     "id": hash(method) % 1000
                 }, timeout=self.timeout, verify=False)
                 
-                # Rule C: Check for rate limiting
+                # Rule 1: Check for rate limiting - maintain reachable status
                 if response.status_code == 429:
                     result.rpc_rate_limit_events += 1
                     if result.rpc_status != "rate_limited":
                         result.rpc_status = "rate_limited"
+                        result.rpc_reachable = True  # Rule 1: HTTP 429 = reachable
                     self.logger.warning(f"Rate limit hit on method {method}, applying backoff")
                     self._apply_exponential_backoff()
                     continue  # Skip this method but continue with others
@@ -298,11 +310,12 @@ class RpcExtractor:
                 if response.status_code == 200:
                     data = response.json()
                     
-                    # Rule C: Check JSON body for rate limit patterns
+                    # Rule 1: Check JSON body for rate limit patterns - maintain reachable status
                     if self._detect_rate_limit(response, data):
                         result.rpc_rate_limit_events += 1
                         if result.rpc_status != "rate_limited":
                             result.rpc_status = "rate_limited"
+                            result.rpc_reachable = True  # Rule 1: Rate limit after successful TLS = reachable
                         self.logger.warning(f"Rate limit detected in JSON response for method {method}")
                         self._apply_exponential_backoff()
                         continue  # Skip this method but continue with others
