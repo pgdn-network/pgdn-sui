@@ -125,6 +125,9 @@ class SuiDataResult:
     # Network throughput metrics (TPS & CPS)
     network_throughput: Optional[Dict[str, Optional[float]]] = None
     
+    # Metrics counter names used for throughput calculation (stage7.md)
+    metrics_counter_names: Optional[Dict[str, str]] = None
+    
     # Open ports detected via TCP connect (for gRPC detection)
     open_ports: Optional[Dict[str, List[int]]] = None
     

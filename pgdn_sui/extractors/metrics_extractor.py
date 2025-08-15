@@ -15,6 +15,150 @@ from ..models import SuiDataResult
 logger = logging.getLogger(__name__)
 
 
+class MetricsThroughputDetector:
+    """
+    Handles detection and parsing of transaction and checkpoint counters from Prometheus metrics
+    for TPS/CPS calculation as specified in stage7.md
+    """
+    
+    # Transaction counter patterns (prefer validator app metrics over host metrics)
+    TX_COUNTER_REGEXES = [
+        r'^sui_(executed|finalized|committed)?_?transactions(_total)?$',
+        r'^sui_total_transaction_blocks(_total)?$',
+        r'^transactions_total$',
+        r'^sui_tx_(executed|committed)_total$',
+    ]
+    
+    # Checkpoint counter patterns
+    CP_COUNTER_REGEXES = [
+        r'^sui_(checkpoint|checkpoints)_(sequence_)?(number|index|height)(_total)?$',
+        r'^checkpoints(_committed)?_total$',
+        r'^sui_consensus_committed_checkpoints(_total)?$',
+    ]
+    
+    def __init__(self):
+        self.tx_patterns = [re.compile(pattern) for pattern in self.TX_COUNTER_REGEXES]
+        self.cp_patterns = [re.compile(pattern) for pattern in self.CP_COUNTER_REGEXES]
+    
+    def detect_counter_families(self, metrics_text: str) -> Tuple[Optional[str], Optional[str]]:
+        """
+        Detect first matching TX and CP counter families from metrics text.
+        Returns: (tx_counter_name, cp_counter_name)
+        """
+        tx_counter = None
+        cp_counter = None
+        
+        # Parse metrics line by line to find counter families
+        for line in metrics_text.split('\n'):
+            line = line.strip()
+            
+            # Skip comments and empty lines
+            if not line or line.startswith('#'):
+                continue
+            
+            # Extract metric name (everything before first space or {)
+            metric_name = line.split()[0].split('{')[0] if line else ''
+            
+            # Check TX patterns (first match wins)
+            if tx_counter is None:
+                for pattern in self.tx_patterns:
+                    if pattern.match(metric_name):
+                        tx_counter = metric_name
+                        break
+            
+            # Check CP patterns (first match wins)
+            if cp_counter is None:
+                for pattern in self.cp_patterns:
+                    if pattern.match(metric_name):
+                        cp_counter = metric_name
+                        break
+            
+            # Early exit if both found
+            if tx_counter and cp_counter:
+                break
+        
+        return tx_counter, cp_counter
+    
+    def parse_counter_values(self, metrics_text: str, tx_counter: str = None, cp_counter: str = None) -> Dict[str, Optional[float]]:
+        """
+        Parse counter values from metrics text for specified counter names.
+        Sums across all series (labels) to get monotonic totals.
+        """
+        result = {
+            'tx_total': None,
+            'cp_total': None,
+            'timestamp': time.time()
+        }
+        
+        tx_sum = 0
+        cp_sum = 0
+        tx_found = False
+        cp_found = False
+        
+        # Parse metrics line by line
+        for line in metrics_text.split('\n'):
+            line = line.strip()
+            
+            # Skip comments and empty lines
+            if not line or line.startswith('#'):
+                continue
+            
+            # Parse metric line: name{labels} value [timestamp]
+            parts = line.split()
+            if len(parts) < 2:
+                continue
+            
+            metric_name_with_labels = parts[0]
+            value_str = parts[1]
+            
+            # Extract metric name (before { or space)
+            metric_name = metric_name_with_labels.split('{')[0]
+            
+            try:
+                value = float(value_str)
+                
+                # Sum TX counter values
+                if tx_counter and metric_name == tx_counter:
+                    tx_sum += value
+                    tx_found = True
+                
+                # Sum CP counter values  
+                if cp_counter and metric_name == cp_counter:
+                    cp_sum += value
+                    cp_found = True
+                    
+            except (ValueError, IndexError):
+                continue
+        
+        # Set results if counters were found
+        if tx_found:
+            result['tx_total'] = tx_sum
+        if cp_found:
+            result['cp_total'] = cp_sum
+        
+        return result
+    
+    def detect_counter_resets(self, current_values: Dict, previous_values: Dict) -> Tuple[bool, bool]:
+        """
+        Detect if counters have reset (decreased) between measurements.
+        Returns: (tx_reset, cp_reset)
+        """
+        tx_reset = False
+        cp_reset = False
+        
+        if (current_values.get('tx_total') is not None and 
+            previous_values.get('tx_total') is not None):
+            if current_values['tx_total'] < previous_values['tx_total']:
+                tx_reset = True
+        
+        if (current_values.get('cp_total') is not None and 
+            previous_values.get('cp_total') is not None):
+            if current_values['cp_total'] < previous_values['cp_total']:
+                cp_reset = True
+        
+        return tx_reset, cp_reset
+
+
 class MetricsExtractor:
     """Handles Prometheus metrics extraction from Sui nodes"""
     
@@ -24,6 +168,7 @@ class MetricsExtractor:
         self.debug_mode = self.config.get('debug', False)
         self.max_sample_length = self.config.get('max_sample_length', 200)
         self.logger = logger
+        self.throughput_detector = MetricsThroughputDetector()
 
     async def extract_metrics_intelligence_async(self, result: SuiDataResult, ip: str) -> bool:
         """Enhanced metrics intelligence extraction with dual port fallback (extend.md)"""

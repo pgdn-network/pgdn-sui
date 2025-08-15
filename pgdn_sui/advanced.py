@@ -678,30 +678,6 @@ class SuiDataExtractor:
         - Independent reasons for TPS vs CPS
         """
         try:
-            # Rule F: Handle unreachable RPC
-            if result.rpc_status == "unreachable":
-                result.network_throughput = {
-                    "tps": None,
-                    "cps": None,
-                    "calculation_window_seconds": None,
-                    "reason": "unreachable_rpc"
-                }
-                self.logger.info(f"Setting TPS/CPS to null for {result.ip}: RPC unreachable")
-                return
-            
-            # Rule F: Handle rate-limited RPC - compute what we can
-            if result.rpc_status == "rate_limited":
-                # If we have some data despite rate limiting, try to compute
-                if result.total_transactions is None and result.checkpoint_height is None:
-                    result.network_throughput = {
-                        "tps": None,
-                        "cps": None,
-                        "calculation_window_seconds": None,
-                        "reason": "rate_limited"
-                    }
-                    self.logger.info(f"Setting TPS/CPS to null for {result.ip}: Rate limited, no data")
-                    return
-            
             # Extract required data from result
             network = result.network if result.network != "unknown" else "mainnet"  # Default fallback
             ip = result.ip
@@ -709,21 +685,84 @@ class SuiDataExtractor:
             total_transactions = result.total_transactions
             checkpoint_height = result.checkpoint_height
             timestamp = result.timestamp
-            
-            # Rule F: Calculate throughput using ThroughputCalculator with stable delta_key
             hostname = getattr(result, 'hostname', None)
-            throughput_data = self.throughput_calculator.calculate_throughput(
-                network=network,
-                ip=ip,
-                port=port,
-                total_transactions=total_transactions,
-                checkpoint_height=checkpoint_height,
-                timestamp=timestamp,
-                hostname=hostname
-            )
+            
+            # Initialize throughput data containers
+            rpc_throughput_data = None
+            metrics_throughput_data = None
+            
+            # Rule F: Calculate RPC-based throughput if RPC is reachable and has data
+            if result.rpc_status != "unreachable" and (total_transactions is not None or checkpoint_height is not None):
+                rpc_throughput_data = self.throughput_calculator.calculate_throughput(
+                    network=network,
+                    ip=ip,
+                    port=port,
+                    total_transactions=total_transactions,
+                    checkpoint_height=checkpoint_height,
+                    timestamp=timestamp,
+                    hostname=hostname
+                )
+            elif result.rpc_status == "unreachable":
+                self.logger.info(f"RPC unreachable for {ip}, will try metrics-based calculation")
+            elif result.rpc_status == "rate_limited":
+                self.logger.info(f"RPC rate limited for {ip}, will try metrics-based calculation")
+            
+            # Stage7.md: Calculate metrics-based throughput if metrics are available
+            if result.metrics_exposed:
+                try:
+                    # Extract metrics counters if available
+                    metrics_data = await self._extract_metrics_counters(result, ip)
+                    if metrics_data and (metrics_data.get('tx_total') is not None or metrics_data.get('cp_total') is not None):
+                        metrics_throughput_data = self.throughput_calculator.calculate_metrics_throughput(
+                            network=network,
+                            ip=ip,
+                            port=port,
+                            metrics_data=metrics_data,
+                            timestamp=timestamp,
+                            hostname=hostname
+                        )
+                        
+                        # Store counter names for future consistency
+                        if 'counter_names' in metrics_data:
+                            result.metrics_counter_names = metrics_data['counter_names']
+                            
+                        self.logger.info(f"Metrics throughput calculated for {ip}: {metrics_throughput_data}")
+                except Exception as e:
+                    self.logger.warning(f"Metrics throughput calculation failed for {ip}: {e}")
+            
+            # Stage7.md: Reconcile RPC and Metrics results if both available
+            if rpc_throughput_data and metrics_throughput_data:
+                throughput_data = self.throughput_calculator.reconcile_rpc_metrics_throughput(
+                    rpc_throughput_data, metrics_throughput_data
+                )
+                self.logger.info(f"Reconciled throughput for {ip}: source={throughput_data.get('source')}, reason={throughput_data.get('reason')}")
+            elif metrics_throughput_data:
+                # Use metrics only
+                throughput_data = metrics_throughput_data
+                self.logger.info(f"Using metrics-only throughput for {ip}")
+            elif rpc_throughput_data:
+                # Use RPC only (existing behavior)
+                throughput_data = rpc_throughput_data
+            else:
+                # Neither RPC nor metrics available - set appropriate reason
+                if result.rpc_status == "unreachable" and not result.metrics_exposed:
+                    reason = "unreachable_rpc_no_metrics"
+                elif result.rpc_status == "unreachable" and result.metrics_exposed:
+                    reason = "missing_counters"  # Metrics available but no TX/CP counters found
+                else:
+                    reason = "missing_counters"
+                
+                throughput_data = {
+                    "tps": None,
+                    "cps": None,
+                    "calculation_window_seconds": None,
+                    "source": "none",
+                    "reason": reason
+                }
+                self.logger.info(f"No throughput data available for {ip}: {reason}")
             
             # Rule F: Handle rate limiting in throughput data
-            if result.rpc_status == "rate_limited":
+            if result.rpc_status == "rate_limited" and throughput_data:
                 # If one counter is missing due to rate limit, set appropriate reason
                 if total_transactions is None and checkpoint_height is not None:
                     throughput_data["tps"] = None
@@ -738,7 +777,7 @@ class SuiDataExtractor:
             result.network_throughput = throughput_data
             
             # Log successful calculation (but not null values) and set evidence strings
-            if throughput_data.get("tps") is not None or throughput_data.get("cps") is not None:
+            if throughput_data and (throughput_data.get("tps") is not None or throughput_data.get("cps") is not None):
                 tps = throughput_data.get('tps')
                 cps = throughput_data.get('cps')
                 window = throughput_data.get('calculation_window_seconds')
@@ -872,6 +911,55 @@ class SuiDataExtractor:
         )
         
         return format_json(response, pretty)
+    
+    async def _extract_metrics_counters(self, result: SuiDataResult, ip: str) -> Optional[Dict[str, Any]]:
+        """
+        Extract transaction and checkpoint counters from metrics for throughput calculation.
+        Implements stage7.md specifications for metrics-based TPS/CPS derivation.
+        """
+        if not result.metrics_exposed:
+            return None
+        
+        # Try to get metrics from known endpoints
+        metrics_endpoints = [
+            f"http://{ip}:9184/metrics",
+            f"http://{ip}:9100/metrics", 
+            f"http://{ip}:9090/metrics",
+            f"http://{ip}:8080/metrics"
+        ]
+        
+        for endpoint in metrics_endpoints:
+            try:
+                import requests
+                response = requests.get(endpoint, timeout=10, verify=False)
+                if response.status_code == 200 and len(response.text) >= 64:
+                    metrics_text = response.text
+                    
+                    # Detect counter families using the throughput detector
+                    tx_counter, cp_counter = self.metrics_extractor.throughput_detector.detect_counter_families(metrics_text)
+                    
+                    if tx_counter or cp_counter:
+                        # Parse current counter values
+                        counter_values = self.metrics_extractor.throughput_detector.parse_counter_values(
+                            metrics_text, tx_counter, cp_counter
+                        )
+                        
+                        # Add counter names for state persistence
+                        counter_values['counter_names'] = {
+                            'tx': tx_counter,
+                            'cp': cp_counter
+                        }
+                        
+                        self.logger.info(f"Extracted metrics counters for {ip}: tx={tx_counter}, cp={cp_counter}")
+                        return counter_values
+                        
+            except Exception as e:
+                self.logger.debug(f"Failed to extract metrics from {endpoint}: {e}")
+                continue
+        
+        # If we reach here, no usable metrics were found
+        self.logger.debug(f"No usable metrics counters found for {ip}")
+        return None
 
 
 # CLI Interface - maintaining the same entry point as original

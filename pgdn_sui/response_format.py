@@ -47,7 +47,7 @@ def standard_response(
         "operation": operation,
         "execution_time_ms": execution_time_ms,
         "total_items": len(formatted_data),
-        "version": "2.9.0"
+        "version": "2.13.0"
     }
     
     # Add any additional metadata
@@ -69,7 +69,7 @@ def error_response(error_message: str, operation: str = "scan") -> Dict[str, Any
             "operation": operation,
             "error": error_message,
             "total_items": 0,
-            "version": "2.9.0"
+            "version": "2.13.0"
         }
     }
 

@@ -309,3 +309,195 @@ class ThroughputCalculator:
         self.state.clear()
         self._save_state()
         logger.info("All throughput calculation state cleared")
+    
+    def calculate_metrics_throughput(self, 
+                                   network: str, 
+                                   ip: str, 
+                                   port: int,
+                                   metrics_data: Dict[str, Any],
+                                   timestamp: Any,
+                                   hostname: Optional[str] = None) -> Dict[str, Optional[float]]:
+        """
+        Calculate TPS and CPS from Prometheus metrics counters.
+        Follows stage7.md specifications for metrics-based throughput calculation.
+        
+        Args:
+            network: Network name (mainnet, testnet, devnet)
+            ip: Node IP address
+            port: Node port
+            metrics_data: Dict containing tx_total, cp_total from parsed metrics
+            timestamp: Current timestamp (datetime, RFC3339 string, or epoch seconds)
+            hostname: Optional hostname for more stable identification
+            
+        Returns:
+            Dict with tps, cps, calculation_window_seconds, source, reason
+        """
+        hostname_or_ip = hostname if hostname and hostname != ip else ip
+        key = self._create_key(network, hostname_or_ip, port) + "_metrics"  # Separate from RPC state
+        ts_now = self._convert_timestamp_to_epoch(timestamp)
+        
+        # Initialize result structure per stage7.md schema
+        result = {
+            "tps": None,
+            "cps": None,
+            "calculation_window_seconds": None,
+            "source": "metrics",
+            "reason": None
+        }
+        
+        # Extract current counter values
+        tx_now = metrics_data.get('tx_total')
+        cp_now = metrics_data.get('cp_total')
+        
+        # Check if we have any counters at all
+        if tx_now is None and cp_now is None:
+            result["reason"] = "missing_counters"
+            return result
+        
+        # Get previous metrics snapshot
+        prev_snapshot = self.state.get(key)
+        
+        if not prev_snapshot:
+            logger.debug(f"No previous metrics snapshot for {key}, storing first observation")
+            result["reason"] = "no_previous_data"
+            
+            # Store first observation
+            self.state[key] = {
+                "tx_total": tx_now,
+                "cp_total": cp_now,
+                "ts_s": ts_now,
+                "counter_names": metrics_data.get('counter_names', {})
+            }
+            self._save_state()
+            return result
+        
+        # Calculate time delta
+        delta_t = ts_now - prev_snapshot.get('ts_s', ts_now)
+        result["calculation_window_seconds"] = round(delta_t, 2)
+        
+        # Validation: require calculation_window_seconds >= 60 per stage7.md
+        if delta_t < 60.0:
+            logger.debug(f"Metrics window too small ({delta_t:.2f}s < 60s), setting TPS/CPS to null")
+            result["reason"] = "validation_failed"
+            return result
+        
+        # Calculate TPS if we have TX counters
+        if tx_now is not None and prev_snapshot.get('tx_total') is not None:
+            tx_prev = prev_snapshot['tx_total']
+            delta_tx = tx_now - tx_prev
+            
+            # Reset detection as per stage7.md
+            if delta_tx < 0:
+                logger.warning(f"TX counter reset detected for {key} (Δtx={delta_tx})")
+                result["reason"] = "reset_detected"
+                # Don't update state on reset - keep previous for next calculation
+                return result
+            else:
+                result["tps"] = round(delta_tx / delta_t, 2)
+        
+        # Calculate CPS if we have CP counters
+        if cp_now is not None and prev_snapshot.get('cp_total') is not None:
+            cp_prev = prev_snapshot['cp_total']
+            delta_cp = cp_now - cp_prev
+            
+            # Reset detection as per stage7.md
+            if delta_cp < 0:
+                logger.warning(f"CP counter reset detected for {key} (Δcp={delta_cp})")
+                result["reason"] = "reset_detected"
+                # Don't update state on reset - keep previous for next calculation
+                return result
+            else:
+                result["cps"] = round(delta_cp / delta_t, 2)
+        
+        # Validate final results
+        if (result["tps"] is not None and result["tps"] < 0) or (result["cps"] is not None and result["cps"] < 0):
+            result["reason"] = "validation_failed"
+            return result
+        
+        # Update state after successful calculation
+        self.state[key] = {
+            "tx_total": tx_now,
+            "cp_total": cp_now,
+            "ts_s": ts_now,
+            "counter_names": metrics_data.get('counter_names', {})
+        }
+        self._save_state()
+        
+        logger.info(f"Metrics throughput calculated for {key}: TPS={result['tps']}, CPS={result['cps']}, window={result['calculation_window_seconds']}s")
+        return result
+    
+    def reconcile_rpc_metrics_throughput(self, 
+                                       rpc_result: Dict[str, Optional[float]], 
+                                       metrics_result: Dict[str, Optional[float]]) -> Dict[str, Optional[float]]:
+        """
+        Reconcile RPC and Metrics throughput calculations as per stage7.md specifications.
+        
+        Args:
+            rpc_result: Result from RPC-based calculation
+            metrics_result: Result from metrics-based calculation
+            
+        Returns:
+            Reconciled result with appropriate source and reason
+        """
+        # Initialize result from metrics (preferred source per stage7.md)
+        result = metrics_result.copy()
+        
+        # Get values for comparison
+        rpc_tps = rpc_result.get("tps")
+        rpc_cps = rpc_result.get("cps")
+        metrics_tps = metrics_result.get("tps")
+        metrics_cps = metrics_result.get("cps")
+        
+        # Only reconcile if both sources have values
+        if rpc_tps is not None and metrics_tps is not None:
+            # Calculate relative error for TPS
+            rel_err_tps = abs(metrics_tps - rpc_tps) / max(1e-9, max(metrics_tps, rpc_tps))
+            
+            if rel_err_tps <= 0.25:
+                # Agreement case: average the values
+                result["tps"] = round((metrics_tps + rpc_tps) / 2, 2)
+                result["source"] = "metrics+rpc"
+                result["reason"] = "agree"
+            else:
+                # Disagreement case: apply preference rules
+                rpc_status = rpc_result.get("rpc_status", "unknown")
+                rpc_window = rpc_result.get("calculation_window_seconds", 0)
+                metrics_window = metrics_result.get("calculation_window_seconds", 0)
+                
+                if (rpc_status in ["rate_limited", "unreliable", "reachable"] and rpc_window < 60) or metrics_window >= 60:
+                    # Prefer metrics
+                    result["source"] = "metrics"
+                    result["reason"] = "rpc_disagree"
+                else:
+                    # Prefer RPC
+                    result["tps"] = rpc_tps
+                    result["source"] = "rpc"
+                    result["reason"] = "metrics_disagree"
+        
+        # Similar logic for CPS
+        if rpc_cps is not None and metrics_cps is not None:
+            rel_err_cps = abs(metrics_cps - rpc_cps) / max(1e-9, max(metrics_cps, rpc_cps))
+            
+            if rel_err_cps <= 0.25:
+                # Agreement case: average the values
+                result["cps"] = round((metrics_cps + rpc_cps) / 2, 2)
+                if result.get("source") != "metrics+rpc":  # Don't override if TPS already set to metrics+rpc
+                    result["source"] = "metrics+rpc"
+                    result["reason"] = "agree"
+            else:
+                # Disagreement case: apply same preference rules
+                rpc_status = rpc_result.get("rpc_status", "unknown")
+                rpc_window = rpc_result.get("calculation_window_seconds", 0)
+                metrics_window = metrics_result.get("calculation_window_seconds", 0)
+                
+                if (rpc_status in ["rate_limited", "unreliable", "reachable"] and rpc_window < 60) or metrics_window >= 60:
+                    # Prefer metrics (already set)
+                    result["source"] = "metrics"
+                    result["reason"] = "rpc_disagree"
+                else:
+                    # Prefer RPC
+                    result["cps"] = rpc_cps
+                    result["source"] = "rpc"
+                    result["reason"] = "metrics_disagree"
+        
+        return result
