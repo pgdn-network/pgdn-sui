@@ -72,6 +72,9 @@ class MetricsExtractor:
             result.metrics_surface = {}
         
         for endpoint_info in metrics_endpoints:
+            # Define endpoint_key before try block to ensure it's available in except blocks
+            endpoint_key = f"{endpoint_info['port']}{endpoint_info['path']}"
+            
             try:
                 start_time = time.time()
                 headers = {"Accept": "text/plain"}
@@ -86,7 +89,6 @@ class MetricsExtractor:
                 response_time = time.time() - start_time
                 
                 # Track this attempt in metrics_surface
-                endpoint_key = f"{endpoint_info['port']}{endpoint_info['path']}"
                 result.metrics_surface[endpoint_key] = {
                     "http_status": str(response.status_code),
                     "port": endpoint_info["port"],

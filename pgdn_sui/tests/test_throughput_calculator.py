@@ -39,8 +39,8 @@ class TestThroughputCalculatorBasics:
         
     def test_create_key(self, calculator):
         """Test key creation for state storage"""
-        key = calculator._create_key("mainnet", "validator", "192.168.1.100", 9184)
-        assert key == "mainnet|validator|192.168.1.100|9184"
+        key = calculator._create_key("mainnet", "192.168.1.100", 9184)
+        assert key == "mainnet|192.168.1.100|9184"
     
     def test_timestamp_conversion(self, calculator):
         """Test timestamp conversion to epoch seconds"""
@@ -87,7 +87,6 @@ class TestThroughputCalculation:
         """Test that first observation stores state but returns nulls"""
         result = calculator.calculate_throughput(
             network="mainnet",
-            node_type="validator", 
             ip="192.168.1.100",
             port=9184,
             total_transactions=1000000,
@@ -101,7 +100,7 @@ class TestThroughputCalculation:
         assert result["calculation_window_seconds"] is None
         
         # Should store state
-        key = "mainnet|validator|192.168.1.100|9184"
+        key = "mainnet|192.168.1.100|9184"
         assert key in calculator.state
         assert calculator.state[key]["total_transactions"] == 1000000
         assert calculator.state[key]["checkpoint_height"] == 500000
@@ -111,13 +110,13 @@ class TestThroughputCalculation:
         """Test successful TPS/CPS calculation"""
         # First observation
         calculator.calculate_throughput(
-            network="mainnet", node_type="validator", ip="192.168.1.100", port=9184,
+            network="mainnet", ip="192.168.1.100", port=9184,
             total_transactions=1000000, checkpoint_height=500000, timestamp=1697372245.0
         )
         
         # Second observation after 2 hours (7200 seconds)
         result = calculator.calculate_throughput(
-            network="mainnet", node_type="validator", ip="192.168.1.100", port=9184,
+            network="mainnet", ip="192.168.1.100", port=9184,
             total_transactions=1408948, checkpoint_height=529420, timestamp=1697379445.0  # +7200s
         )
         
@@ -132,13 +131,13 @@ class TestThroughputCalculation:
         """Test guardrail: Δt < 1.0 second"""
         # First observation
         calculator.calculate_throughput(
-            network="mainnet", node_type="validator", ip="192.168.1.100", port=9184,
+            network="mainnet", ip="192.168.1.100", port=9184,
             total_transactions=1000000, checkpoint_height=500000, timestamp=1697372245.0
         )
         
         # Second observation only 0.5 seconds later
         result = calculator.calculate_throughput(
-            network="mainnet", node_type="validator", ip="192.168.1.100", port=9184, 
+            network="mainnet", ip="192.168.1.100", port=9184, 
             total_transactions=1000100, checkpoint_height=500001, timestamp=1697372245.5
         )
         
@@ -151,13 +150,13 @@ class TestThroughputCalculation:
         """Test guardrail: negative Δtx (counter reset)"""
         # First observation
         calculator.calculate_throughput(
-            network="mainnet", node_type="validator", ip="192.168.1.100", port=9184,
+            network="mainnet", ip="192.168.1.100", port=9184,
             total_transactions=1000000, checkpoint_height=500000, timestamp=1697372245.0
         )
         
         # Second observation with lower transaction count (reset)
         result = calculator.calculate_throughput(
-            network="mainnet", node_type="validator", ip="192.168.1.100", port=9184,
+            network="mainnet", ip="192.168.1.100", port=9184,
             total_transactions=999000, checkpoint_height=500100, timestamp=1697372305.0  # +60s
         )
         
@@ -170,13 +169,13 @@ class TestThroughputCalculation:
         """Test guardrail: negative Δcp (counter reset)"""
         # First observation
         calculator.calculate_throughput(
-            network="mainnet", node_type="validator", ip="192.168.1.100", port=9184,
+            network="mainnet", ip="192.168.1.100", port=9184,
             total_transactions=1000000, checkpoint_height=500000, timestamp=1697372245.0
         )
         
         # Second observation with lower checkpoint (reset)
         result = calculator.calculate_throughput(
-            network="mainnet", node_type="validator", ip="192.168.1.100", port=9184,
+            network="mainnet", ip="192.168.1.100", port=9184,
             total_transactions=1003600, checkpoint_height=499500, timestamp=1697372305.0  # +60s
         )
         
@@ -189,7 +188,7 @@ class TestThroughputCalculation:
         """Test handling of None/missing data"""
         # Test with None values
         result = calculator.calculate_throughput(
-            network="mainnet", node_type="validator", ip="192.168.1.100", port=9184,
+            network="mainnet", ip="192.168.1.100", port=9184,
             total_transactions=None, checkpoint_height=None, timestamp=1697372245.0
         )
         
@@ -217,14 +216,14 @@ class TestStateManagement:
         # First calculator instance
         calc1 = ThroughputCalculator(state_file_path=temp_state_file)
         calc1.calculate_throughput(
-            network="mainnet", node_type="validator", ip="192.168.1.100", port=9184,
+            network="mainnet", ip="192.168.1.100", port=9184,
             total_transactions=1000000, checkpoint_height=500000, timestamp=1697372245.0
         )
         
         # Second calculator instance should load existing state
         calc2 = ThroughputCalculator(state_file_path=temp_state_file)
         result = calc2.calculate_throughput(
-            network="mainnet", node_type="validator", ip="192.168.1.100", port=9184,
+            network="mainnet", ip="192.168.1.100", port=9184,
             total_transactions=1003600, checkpoint_height=500100, timestamp=1697372305.0  # +60s
         )
         
@@ -240,7 +239,7 @@ class TestStateManagement:
             
             calc = ThroughputCalculator(state_file_path=str(state_file))
             calc.calculate_throughput(
-                network="mainnet", node_type="validator", ip="192.168.1.100", port=9184,
+                network="mainnet", ip="192.168.1.100", port=9184,
                 total_transactions=1000000, checkpoint_height=500000, timestamp=1697372245.0
             )
             
@@ -290,7 +289,7 @@ class TestStateManagement:
         """Test state info retrieval for debugging"""
         calc = ThroughputCalculator(state_file_path=temp_state_file)
         calc.calculate_throughput(
-            network="mainnet", node_type="validator", ip="192.168.1.100", port=9184,
+            network="mainnet", ip="192.168.1.100", port=9184,
             total_transactions=1000000, checkpoint_height=500000, timestamp=time.time()
         )
         
@@ -304,7 +303,7 @@ class TestStateManagement:
         """Test clearing all state"""
         calc = ThroughputCalculator(state_file_path=temp_state_file)
         calc.calculate_throughput(
-            network="mainnet", node_type="validator", ip="192.168.1.100", port=9184,
+            network="mainnet", ip="192.168.1.100", port=9184,
             total_transactions=1000000, checkpoint_height=500000, timestamp=time.time()
         )
         
@@ -341,13 +340,13 @@ class TestIntegrationScenarios:
         
         # First observation  
         calculator.calculate_throughput(
-            network="mainnet", node_type="validator", ip="192.168.1.100", port=9184,
+            network="mainnet", ip="192.168.1.100", port=9184,
             total_transactions=3955902979, checkpoint_height=178064252, timestamp=prev_time
         )
         
         # Second observation
         result = calculator.calculate_throughput(
-            network="mainnet", node_type="validator", ip="192.168.1.100", port=9184,
+            network="mainnet", ip="192.168.1.100", port=9184,
             total_transactions=3956311927, checkpoint_height=178093672, timestamp=now_time
         )
         
@@ -359,13 +358,13 @@ class TestIntegrationScenarios:
         """Test Example B from tps.md (noisy short window)"""
         # First observation
         calculator.calculate_throughput(
-            network="mainnet", node_type="validator", ip="192.168.1.100", port=9184,
+            network="mainnet", ip="192.168.1.100", port=9184,
             total_transactions=1000000, checkpoint_height=500000, timestamp=1697372245.0
         )
         
         # Second observation with Δt = 0.6s (should trigger guardrail)
         result = calculator.calculate_throughput(
-            network="mainnet", node_type="validator", ip="192.168.1.100", port=9184,
+            network="mainnet", ip="192.168.1.100", port=9184,
             total_transactions=1000100, checkpoint_height=500001, timestamp=1697372245.6
         )
         
@@ -377,13 +376,13 @@ class TestIntegrationScenarios:
         """Test Example C from tps.md (counter reset)"""
         # First observation
         calculator.calculate_throughput(
-            network="mainnet", node_type="validator", ip="192.168.1.100", port=9184,
+            network="mainnet", ip="192.168.1.100", port=9184,
             total_transactions=1000000, checkpoint_height=500000, timestamp=1697372245.0
         )
         
         # Δtx < 0 but Δcp > 0 -> tps=null, cps valid
         result = calculator.calculate_throughput(
-            network="mainnet", node_type="validator", ip="192.168.1.100", port=9184,
+            network="mainnet", ip="192.168.1.100", port=9184,
             total_transactions=999000, checkpoint_height=500100, timestamp=1697372305.0  # +60s
         )
         
@@ -397,13 +396,13 @@ class TestIntegrationScenarios:
         
         # Node 1 first observation
         result1a = calculator.calculate_throughput(
-            network="mainnet", node_type="validator", ip="192.168.1.100", port=9184,
+            network="mainnet", ip="192.168.1.100", port=9184,
             total_transactions=1000000, checkpoint_height=500000, timestamp=base_time
         )
         
         # Node 2 first observation  
         result2a = calculator.calculate_throughput(
-            network="mainnet", node_type="validator", ip="192.168.1.101", port=9184,
+            network="mainnet", ip="192.168.1.101", port=9184,
             total_transactions=2000000, checkpoint_height=600000, timestamp=base_time
         )
         
@@ -413,7 +412,7 @@ class TestIntegrationScenarios:
         
         # Node 1 second observation
         result1b = calculator.calculate_throughput(
-            network="mainnet", node_type="validator", ip="192.168.1.100", port=9184,
+            network="mainnet", ip="192.168.1.100", port=9184,
             total_transactions=1003600, checkpoint_height=500100, timestamp=base_time + 60
         )
         
@@ -423,7 +422,7 @@ class TestIntegrationScenarios:
         
         # Node 2 second observation (different timing and values)
         result2b = calculator.calculate_throughput(
-            network="mainnet", node_type="validator", ip="192.168.1.101", port=9184,
+            network="mainnet", ip="192.168.1.101", port=9184,
             total_transactions=2007200, checkpoint_height=600200, timestamp=base_time + 120
         )
         
@@ -438,25 +437,25 @@ class TestIntegrationScenarios:
         # Same IP/port but different networks
         # Mainnet observation
         calculator.calculate_throughput(
-            network="mainnet", node_type="validator", ip="192.168.1.100", port=9184,
+            network="mainnet", ip="192.168.1.100", port=9184,
             total_transactions=1000000, checkpoint_height=500000, timestamp=base_time
         )
         
         # Testnet observation  
         calculator.calculate_throughput(
-            network="testnet", node_type="validator", ip="192.168.1.100", port=9184,
+            network="testnet", ip="192.168.1.100", port=9184,
             total_transactions=2000000, checkpoint_height=600000, timestamp=base_time
         )
         
         # Second mainnet observation
         result_mainnet = calculator.calculate_throughput(
-            network="mainnet", node_type="validator", ip="192.168.1.100", port=9184,
+            network="mainnet", ip="192.168.1.100", port=9184,
             total_transactions=1003600, checkpoint_height=500100, timestamp=base_time + 60
         )
         
         # Second testnet observation  
         result_testnet = calculator.calculate_throughput(
-            network="testnet", node_type="validator", ip="192.168.1.100", port=9184,
+            network="testnet", ip="192.168.1.100", port=9184,
             total_transactions=2001800, checkpoint_height=600050, timestamp=base_time + 60
         )
         
@@ -483,13 +482,13 @@ class TestQualityChecks:
         """Test logging for unusual TPS values"""
         # First observation
         calculator.calculate_throughput(
-            network="mainnet", node_type="validator", ip="192.168.1.100", port=9184,
+            network="mainnet", ip="192.168.1.100", port=9184,
             total_transactions=1000000, checkpoint_height=500000, timestamp=1697372245.0
         )
         
         # Second observation with very high TPS (>10,000)
         calculator.calculate_throughput(
-            network="mainnet", node_type="validator", ip="192.168.1.100", port=9184,
+            network="mainnet", ip="192.168.1.100", port=9184,
             total_transactions=1720000, checkpoint_height=500100, timestamp=1697372305.0  # +60s
         )
         
@@ -504,13 +503,13 @@ class TestQualityChecks:
         """Test logging for unusual CPS values"""
         # First observation
         calculator.calculate_throughput(
-            network="mainnet", node_type="validator", ip="192.168.1.100", port=9184,
+            network="mainnet", ip="192.168.1.100", port=9184,
             total_transactions=1000000, checkpoint_height=500000, timestamp=1697372245.0
         )
         
         # Second observation with very high CPS (>10)
         calculator.calculate_throughput(
-            network="mainnet", node_type="validator", ip="192.168.1.100", port=9184,
+            network="mainnet", ip="192.168.1.100", port=9184,
             total_transactions=1003600, checkpoint_height=500800, timestamp=1697372305.0  # +60s
         )
         
